@@ -1,0 +1,115 @@
+package com.ayanami.reader.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import com.ayanami.reader.core.model.BookChapter
+import com.ayanami.reader.ui.ReaderUiState
+import com.ayanami.reader.ui.ReaderViewModel
+import com.ayanami.reader.ui.components.DividerLine
+import com.ayanami.reader.ui.components.EmptyHint
+import com.ayanami.reader.ui.components.ListRow
+import com.ayanami.reader.ui.components.Pill
+import com.ayanami.reader.ui.theme.LocalReaderTokens
+
+@Composable
+fun BookDetailScreen(
+    vm: ReaderViewModel,
+    state: ReaderUiState,
+    onBack: () -> Unit,
+    onRead: (BookChapter, Int) -> Unit
+) {
+    val t = LocalReaderTokens.current
+    Column(modifier = Modifier.fillMaxSize().background(t.background)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 20.dp, end = 22.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "返回", tint = t.textPrimary)
+            }
+            Text(
+                state.openedBook?.name ?: "详情",
+                style = MaterialTheme.typography.titleLarge,
+                color = t.textPrimary,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (state.loadingToc) {
+            Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(modifier = Modifier.size(26.dp), color = t.primary, strokeWidth = 2.dp)
+            }
+            return@Column
+        }
+
+        val book = state.openedBook
+        if (book == null) {
+            EmptyHint("没有打开的书")
+            return@Column
+        }
+
+        LazyColumn(modifier = Modifier.fillMaxSize()) {
+            item {
+                Column(Modifier.padding(horizontal = 22.dp, vertical = 8.dp)) {
+                    Text(book.author.ifBlank { "未知作者" },
+                        style = MaterialTheme.typography.bodyMedium, color = t.textSecondary)
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Pill(book.originName, t.primary)
+                        book.kind?.takeIf { it.isNotBlank() }?.let { Pill(it, t.textSecondary) }
+                        book.lastChapter?.takeIf { it.isNotBlank() }?.let {
+                            Pill(it.take(14), t.accent)
+                        }
+                    }
+                    book.intro?.takeIf { it.isNotBlank() }?.let { intro ->
+                        Spacer(Modifier.height(14.dp))
+                        Text(intro, style = MaterialTheme.typography.bodyMedium, color = t.textSecondary)
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "目录 · ${state.toc.size} 章",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = t.textPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+            }
+            itemsIndexed(state.toc) { index, chapter ->
+                ListRow(
+                    title = chapter.title,
+                    subtitle = if (chapter.isVolume) "卷" else null,
+                    onClick = { onRead(chapter, index) }
+                )
+                DividerLine()
+            }
+            item { Spacer(Modifier.height(40.dp)) }
+        }
+    }
+}

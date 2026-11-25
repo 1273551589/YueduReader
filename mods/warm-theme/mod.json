@@ -1,0 +1,10 @@
+{
+  "id": "warm-theme",
+  "name": "暖色调主题",
+  "version": "1.0.0",
+  "author": "不想睡觉",
+  "minAppVersion": "0.1.0",
+  "type": "theme",
+  "entry": "theme.json",
+  "priority": 10
+}

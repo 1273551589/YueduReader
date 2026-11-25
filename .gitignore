@@ -1,0 +1,23 @@
+# 构建产物
+build/
+.gradle/
+.kotlin/
+*/build/
+out/
+*.class
+
+# 本地环境（不同机器 SDK 路径不同）
+local.properties
+
+# APK：走 GitHub Releases 附件，不进 git
+dist/*.apk
+
+# shim-fidelity 的第三方 jar：用 fetch-libs.sh 下载
+shim-fidelity/lib/*.jar
+
+# 设计文档：含个人环境细节，不公开
+方案.md
+
+# 系统
+.DS_Store
+.alma-snapshots/

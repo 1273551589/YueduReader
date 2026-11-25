@@ -1,0 +1,9 @@
+{
+  "id": "light-novel-sources",
+  "name": "轻小说书源包",
+  "version": "1.0.0",
+  "author": "不想睡觉",
+  "type": "sources",
+  "entry": "sources/sfacg.json",
+  "priority": 50
+}

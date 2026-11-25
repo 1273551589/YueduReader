@@ -1,0 +1,57 @@
+[
+  {
+    "bookSourceUrl": "https://book.sfacg.com",
+    "bookSourceName": "SF轻小说",
+    "bookSourceGroup": "轻小说",
+    "bookSourceType": 0,
+    "bookSourceComment": "SF轻小说（sfacg）站内搜索 + 目录 + 正文。非 R18 向的日系/国产轻小说站点。",
+    "bookSourceEnabled": true,
+    "enabledExplore": false,
+    "customOrder": 1,
+    "weight": 0,
+    "lastUpdateTime": 1764050000000,
+    "respondTime": 180000,
+    "header": "{\"User-Agent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\"}",
+    "searchUrl": "http://s.sfacg.com/?Key={{key}}&S=1&SS=0",
+    "exploreUrl": "",
+    "ruleSearch": {
+      "bookList": "ul[style] > li:not(.Conjunction)",
+      "name": "strong.F14PX > a.orange_link2@text",
+      "author": "@text##^[\\s\\S]*?综合信息：\\s*([^/\\n]+?)/[\\s\\S]*$##$1",
+      "intro": "@text##^[\\s\\S]*?综合信息：\\s*[^/\\n]+/[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}\\s+[0-9:]+([\\s\\S]*)$##$1",
+      "bookUrl": "strong.F14PX > a.orange_link2@href",
+      "coverUrl": "img@src##\\?.*$##",
+      "kind": "",
+      "lastChapter": "",
+      "updateTime": "@text##^[\\s\\S]*?综合信息：\\s*[^/\\n]+?/([0-9]{4}/[0-9]{1,2}/[0-9]{1,2}\\s+[0-9:]+)[\\s\\S]*$##$1",
+      "wordCount": ""
+    },
+    "ruleExplore": {},
+    "ruleBookInfo": {
+      "init": "",
+      "name": "h1.title span.text@text##VIP##",
+      "author": "div.author-info div.author-name span@text",
+      "intro": "p.introduce@text",
+      "kind": "div.count-detail div.text-row span.text.0@text##类型：##",
+      "coverUrl": "div.d-banner@style##url\\(([^)]+)\\)##$1",
+      "wordCount": "div.count-detail div.text-row span.text.1@text##字数：##",
+      "lastChapter": "",
+      "updateTime": "div.count-detail div.text-row span.text.2@text##更新：##",
+      "tocUrl": "a.btn.yellow@href"
+    },
+    "ruleToc": {
+      "chapterList": "div.catalog-list ul.clearfix > li",
+      "chapterName": "a@text##^[\\s\\uE900-\\uE9FF]+##",
+      "chapterUrl": "a@href",
+      "nextTocUrl": "",
+      "isVolume": ""
+    },
+    "ruleContent": {
+      "content": "div#ChapterBody@html",
+      "title": "h1.article-title@text",
+      "nextContentUrl": "a.ctrl-btn.next-btn@href",
+      "replaceRegex": "",
+      "imageStyle": "FULL"
+    }
+  }
+]

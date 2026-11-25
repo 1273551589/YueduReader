@@ -1,0 +1,10 @@
+{
+  "primary": "#B4622E",
+  "background": "#FBF7F2",
+  "surface": "#FFFFFF",
+  "textPrimary": "#2B2119",
+  "textSecondary": "#94887C",
+  "accent": "#C8871E",
+  "cornerRadius": 18,
+  "spacing": 24
+}
