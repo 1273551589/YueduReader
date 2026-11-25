@@ -18,6 +18,9 @@ shim-fidelity/lib/*.jar
 # 设计文档：含个人环境细节，不公开
 方案.md
 
+# 发布脚本（含 token 用法，不进仓库）
+scripts-publish.sh
+
 # 系统
 .DS_Store
 .alma-snapshots/
