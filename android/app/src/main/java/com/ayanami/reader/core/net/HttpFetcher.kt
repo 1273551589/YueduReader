@@ -49,6 +49,22 @@ object HttpFetcher {
     @Volatile
     var minIntervalPerHostMs: Long = 0L
 
+    /**
+     * 是否启用本层的同步限流。
+     *
+     * ⚠️ **默认 false**。v0.6.0 是默认开着的，那是个设计错误：
+     *
+     * 这一层用的是 `Thread.sleep`（在 OkHttp 的 IO 线程上），
+     * 一旦有间隔，20 个源的并发搜索会**各自占住一个线程干等**，
+     * Dispatchers.IO 的线程池很快被占满，后面的请求排队到超时 ——
+     * 体感就是「搜索卡死」。
+     *
+     * 正确的做法是上层用协程 `delay` 排队（见 [HostGate]），
+     * 不占线程。这里只在少数明确需要「粗暴阻塞」的场合才打开。
+     */
+    @Volatile
+    var blockingThrottleEnabled: Boolean = false
+
     /** 附加请求头工厂（Pixiv 的 Referer 走这里，避免污染所有书源）。 */
     @Volatile
     var headerDecorator: ((String) -> Map<String, String>)? = null
@@ -106,7 +122,7 @@ object HttpFetcher {
                 .header("Accept", "*/*")
             // ⚠️ 千万不要手动设 `Accept-Encoding`！
             // OkHttp 只在**它自己**设置该头时才做透明 gzip 解压；
-            // 一旦我们插手，它就不再解压，resp.body?.bytes() 拿到的是一堆
+            // 一旦我们插手，它就不再解压，resp.body.bytes() 拿到的是一堆
             // 压缩字节，转 String 后全是乱码 → 目录/正文全部 SelectorEmpty。
             // （实测：换 OkHttp 后 SF 书源 421 章目录直接变 0 章。）
 
@@ -137,7 +153,7 @@ object HttpFetcher {
                     // 403 / 429 / 503 是明确拒绝，上层不应重试
                     return@withContext FetchResult.Err(RuleError.HttpStatus(code))
                 }
-                val bytes = resp.body?.bytes() ?: ByteArray(0)
+                val bytes = resp.body.bytes()
                 val cs = charsetName?.let { runCatching { Charset.forName(it) }.getOrNull() }
                     ?: guessCharset(bytes, resp.header("Content-Type"))
                 FetchResult.Ok(String(bytes, cs), resp.request.url.toString(), code)
@@ -179,6 +195,7 @@ object HttpFetcher {
     }
 
     private fun throttle(host: String) {
+        if (!blockingThrottleEnabled) return
         val interval = minIntervalPerHostMs
         if (interval <= 0) return
         synchronized(hostLock) {

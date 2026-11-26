@@ -11,8 +11,8 @@ android {
         applicationId = "com.ayanami.reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.6.0"
+        versionCode = 13
+        versionName = "0.7.1"
     }
 
     buildTypes {
@@ -47,7 +47,15 @@ android {
         unitTests.apply {
             // 端到端测试要真联网
             isIncludeAndroidResources = true
-            all { it.jvmArgs("-Dfile.encoding=UTF-8") }
+            all {
+                it.jvmArgs("-Dfile.encoding=UTF-8")
+                // 把 -DsourceLedger.online=true 之类从 Gradle 转发给测试 JVM。
+                // 不转发的话命令行加的 -D 只会落在 Gradle 自己的 JVM 上，
+                // System.getProperty 在测试里读不到 —— 实测过，白跑一轮。
+                listOf("sourceLedger.online", "skipOnline", "pixiv.online").forEach { key ->
+                    System.getProperty(key)?.let { v -> it.systemProperty(key, v) }
+                }
+            }
         }
     }
 }

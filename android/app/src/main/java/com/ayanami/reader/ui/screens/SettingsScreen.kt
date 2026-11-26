@@ -270,35 +270,94 @@ fun SettingsScreen(
                 color = t.textSecondary
             )
             Spacer(Modifier.height(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("PHPSESSID", style = MaterialTheme.typography.titleMedium,
-                        color = t.textPrimary, fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        if (s.pixivCookie.isBlank()) "未配置" else "已配置（${s.pixivCookie.take(6)}…）",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (s.pixivCookie.isBlank()) t.textSecondary else t.primary
-                    )
-                }
-                ArrowButton("配置", onClick = { /* 后续版本弹输入框 */ })
-            }
+            // ⚠️ v0.6.0 这里两个「配置」按钮都是空 lambda —— 点了什么都不发生。
+            // 现在做成真的能填的输入框（弹窗内联展开，不跳页面）。
+            SecretField(
+                label = "PHPSESSID",
+                hint = "浏览器登录 pixiv.net 后，从 Cookie 里复制 PHPSESSID 的值",
+                value = s.pixivCookie,
+                onChange = { s.pixivCookie = it; vm.notifySettingsChanged() }
+            )
             Spacer(Modifier.height(10.dp))
             DividerLine()
             Spacer(Modifier.height(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("代理", style = MaterialTheme.typography.titleMedium,
-                        color = t.textPrimary, fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        s.proxyUrl.ifBlank { "直连（无代理）" },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = t.textSecondary
-                    )
+            SecretField(
+                label = "代理地址",
+                hint = "http://192.168.1.10:7890 或 socks5://192.168.1.10:1080；留空直连",
+                value = s.proxyUrl,
+                onChange = { s.proxyUrl = it; vm.notifySettingsChanged() },
+                plain = true
+            )
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+
+            // ---- 图床镜像 ----
+            Text(
+                "图片镜像",
+                style = MaterialTheme.typography.titleMedium,
+                color = t.textPrimary,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                "图床 i.pximg.net 必须有 Referer 才能读，国内网络常直连失败。" +
+                    "换反代域名可解决裂图。",
+                style = MaterialTheme.typography.bodySmall,
+                color = t.textSecondary
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                com.ayanami.reader.core.pixiv.PixivImageUrls.KNOWN_MIRRORS.forEach { host ->
+                    val on = s.pixivImageMirror == host
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (on) t.primary else t.textSecondary.copy(alpha = 0.10f))
+                            .clickable {
+                                s.pixivImageMirror = host
+                                vm.notifySettingsChanged()
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            if (host == com.ayanami.reader.core.pixiv.PixivImageUrls.OFFICIAL_HOST)
+                                "官方直连" else host,
+                            fontSize = 11.sp,
+                            color = if (on) Color.White else t.textPrimary
+                        )
+                    }
                 }
-                ArrowButton("配置", onClick = { /* 后续版本 */ })
             }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "当前：${s.pixivImageMirror}",
+                style = MaterialTheme.typography.bodySmall,
+                color = t.primary
+            )
+
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+
+            // ---- API 镜像 ----
+            SecretField(
+                label = "API 镜像（可选）",
+                hint = "自建反代时填，例如 https://px.example.com；留空用官方 pixiv.net",
+                value = s.pixivApiBase,
+                onChange = { s.pixivApiBase = it; vm.notifySettingsChanged() },
+                plain = true
+            )
+
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "免登录可直接看：插画日/周/月榜、热门标签、作品详情、小说正文、搜索。\n" +
+                    "R18 榜单与个人收藏需要填 PHPSESSID。\n" +
+                    "直连被阻断时（TLS 中断/超时），填代理或换图片镜像。",
+                style = MaterialTheme.typography.bodySmall,
+                lineHeight = 18.sp,
+                color = t.textSecondary
+            )
         }
 
         // ================= 关于 =================
@@ -351,6 +410,83 @@ private fun SettingCard(content: @Composable () -> Unit) {
             .padding(15.dp)
     ) {
         Column { content() }
+    }
+}
+
+/**
+ * 可折叠的密钥/地址输入行。
+ *
+ * 默认收起只显示「已配置 / 未配置」，点开才是输入框 ——
+ * 这类字段用户一辈子只填一次，不该长期占着屏幕高度。
+ *
+ * @param plain 是否明文显示。代理地址不是秘密，明文更易核对；
+ *   Cookie 默认隐藏，点「显示」才看。
+ */
+@Composable
+private fun SecretField(
+    label: String,
+    hint: String,
+    value: String,
+    onChange: (String) -> Unit,
+    plain: Boolean = false
+) {
+    val t = LocalReaderTokens.current
+    var open by remember { mutableStateOf(false) }
+    var reveal by remember { mutableStateOf(false) }
+
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = t.textPrimary,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    when {
+                        value.isBlank() -> "未配置"
+                        plain -> value
+                        else -> "已配置（${value.take(4)}…${value.takeLast(2)}）"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (value.isBlank()) t.textSecondary else t.primary
+                )
+            }
+            ArrowButton(if (open) "收起" else "配置") { open = !open }
+        }
+        if (open) {
+            Spacer(Modifier.height(10.dp))
+            androidx.compose.material3.OutlinedTextField(
+                value = value,
+                onValueChange = onChange,
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text(hint, fontSize = 12.sp, color = t.textSecondary) },
+                singleLine = true,
+                shape = RoundedCornerShape(10.dp),
+                visualTransformation = if (plain || reveal) {
+                    androidx.compose.ui.text.input.VisualTransformation.None
+                } else {
+                    androidx.compose.ui.text.input.PasswordVisualTransformation()
+                },
+                trailingIcon = if (plain) null else {
+                    {
+                        Text(
+                            if (reveal) "隐藏" else "显示",
+                            fontSize = 11.sp,
+                            color = t.primary,
+                            modifier = Modifier
+                                .clickable { reveal = !reveal }
+                                .padding(horizontal = 8.dp)
+                        )
+                    }
+                }
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(hint, style = MaterialTheme.typography.bodySmall,
+                color = t.textSecondary.copy(alpha = 0.8f))
+        }
     }
 }
 

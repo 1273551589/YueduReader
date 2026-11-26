@@ -397,7 +397,7 @@ class SourceSession(
             if (!visitedPages.add(pageUrl)) break
 
             val currentBody = firstBody ?: run {
-                val r = HttpFetcher.fetch(pageUrl!!, headers = mergedHeaders())
+                val r = HttpFetcher.fetch(pageUrl, headers = mergedHeaders())
                 if (r is FetchResult.Ok) r.body else {
                     if (out.isEmpty()) lastError = (r as FetchResult.Err).error
                     break

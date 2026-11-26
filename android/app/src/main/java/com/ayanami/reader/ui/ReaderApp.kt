@@ -38,7 +38,10 @@ import androidx.navigation.compose.rememberNavController
 import com.ayanami.reader.ui.screens.BookDetailScreen
 import com.ayanami.reader.ui.screens.BookstoreScreen
 import com.ayanami.reader.ui.screens.ModsScreen
+import com.ayanami.reader.ui.screens.PixivArtistScreen
 import com.ayanami.reader.ui.screens.PixivScreen
+import com.ayanami.reader.ui.screens.PixivViewerScreen
+import com.ayanami.reader.ui.savePixivImage
 import com.ayanami.reader.ui.screens.ReadScreen
 import com.ayanami.reader.ui.screens.SearchScreen
 import com.ayanami.reader.ui.screens.SettingsScreen
@@ -85,7 +88,10 @@ fun ReaderApp(vm: ReaderViewModel) {
                     onOpen = { hit ->
                         vm.openHit(hit)
                         nav.navigate("book")
-                    }
+                    },
+                    onOpenViewer = { nav.navigate("pixivViewer") },
+                    onOpenNovel = { nav.navigate("read") },
+                    onOpenArtist = { nav.navigate("pixivArtist") }
                 )
             }
             composable("book") {
@@ -99,7 +105,27 @@ fun ReaderApp(vm: ReaderViewModel) {
                 )
             }
             composable("read") {
-                ReadScreen(vm, state, onBack = { nav.popBackStack() })
+                ReadScreen(
+                    vm, state,
+                    onBack = { nav.popBackStack() },
+                    // Pixiv 小说的正文是一次性拉回全部再本地切章的，
+                    // 所以切章走内存而不是书源网络层
+                    onPixivChapter = { index -> vm.loadPixivChapter(index) }
+                )
+            }
+            composable("pixivArtist") {
+                PixivArtistScreen(
+                    vm = vm,
+                    onBack = { nav.popBackStack() },
+                    onOpenViewer = { nav.navigate("pixivViewer") }
+                )
+            }
+            composable("pixivViewer") {
+                PixivViewerScreen(
+                    vm = vm,
+                    onBack = { nav.popBackStack() },
+                    onSave = { url -> vm.savePixivImage(url) }
+                )
             }
             composable("sources") {
                 SourcesScreen(vm, state, onBack = { nav.popBackStack() })
@@ -153,7 +179,8 @@ private fun HomeWithTabs(vm: ReaderViewModel, state: ReaderUiState, nav: NavHost
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = t.primary,
                             selectedTextColor = t.primary,
-                            indicatorColor = t.primary.copy(alpha = 0.12f),
+                            // 指示器用浅紫实底（和全 App 的胶囊体系一致）
+                            indicatorColor = com.ayanami.reader.ui.theme.PillSelectedBg,
                             unselectedIconColor = t.textSecondary,
                             unselectedTextColor = t.textSecondary
                         )
@@ -182,14 +209,34 @@ private fun HomeWithTabs(vm: ReaderViewModel, state: ReaderUiState, nav: NavHost
                         nav.navigate("book")
                     }
                 )
-                Tab.PIXIV.route -> PixivScreen(vm, state)
+                Tab.PIXIV.route -> PixivScreen(
+                    vm, state,
+                    onOpenNovel = { nav.navigate("read") },
+                    onOpenViewer = { nav.navigate("pixivViewer") },
+                    onOpenSettings = { current = Tab.SETTINGS.route },
+                    // 点 Tag → 切到搜索页并带上关键词
+                    // 点 Tag：切到搜索页的「Pixiv插画」Tab + 填关键词 + 立即搜索。
+                    // 三件事必须在 openPixivSearch 里一起做，否则会出现
+                    // 「跳到搜索页但停在书源 Tab、关键词是空的」。
+                    onSearchTag = { tag ->
+                        vm.openPixivSearch(
+                            tag,
+                            com.ayanami.reader.ui.PixivSearchMode.ILLUST
+                        )
+                        current = Tab.SEARCH.route
+                    },
+                    onOpenArtist = { nav.navigate("pixivArtist") }
+                )
                 Tab.SEARCH.route -> SearchScreen(
                     vm, state,
                     onBack = null,
                     onOpen = { hit ->
                         vm.openHit(hit)
                         nav.navigate("book")
-                    }
+                    },
+                    onOpenViewer = { nav.navigate("pixivViewer") },
+                    onOpenNovel = { nav.navigate("read") },
+                    onOpenArtist = { nav.navigate("pixivArtist") }
                 )
                 Tab.SETTINGS.route -> SettingsScreen(
                     vm, state,

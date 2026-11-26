@@ -7,12 +7,131 @@
 ## [Unreleased]
 
 ### 计划中
-- Pixiv 端口（Referer 注入 / 热榜 / 正文语法 / 瀑布流）
-- 搜索并发（方案允许 4 并发，现在是串行）
-- 下载前台服务（通知栏进度，切后台不中断）
-- 左右翻页实现（现在只存了设置，实际都是滚动）
-- 书源规则编辑 + 改完即测（现在改书源必须重新导入整个 JSON）
+- Room 迁移（书源 / 体检 / 进度 / 书城快照）
+- 下载前台服务（通知栏进度，切后台不中断）+ EPUB 导出
+- 书源规则可视化编辑 + 改完即测
+- 可选 WebView 过盾兜底
+- 画师作品分页加载
 - MOD 单独禁用
+
+---
+
+## [0.7.1] - 2026-11-26
+
+**质量收口**：修掉 v0.7.0 的 6 个真实缺陷，小说榜首屏 10 秒 → 2.4 秒，零编译警告。
+
+### 修复
+
+- **榜单与搜索状态互相覆盖**：`pixivState.illusts` / `novels` / `loading` /
+  `error` / `loadedOnce` 被 PixivScreen 和 SearchScreen 共用，
+  在搜索页搜完插画切回 Pixiv，排行榜会被 48 条搜索结果覆盖。
+  现在拆成 `ranking*` / `search*` 两套字段，`resetRanking()` 与
+  `resetSearch()` 互不干扰
+- **小说榜首屏等 10 秒**：原来「提 12 个 id → 逐条打 `/ajax/novel/<id>`
+  （串行 900ms）→ 全部回来才渲染」。实测榜单页里内嵌了完整的
+  `assign.display_a.rank_a` JSON（标题/作者/字数/收藏/标签/封面/系列全有），
+  改为「1 个请求解析 `rank_a` 立即上屏 + 后台逐条补详情」，
+  实测首屏 **2387 ms**
+- **点 Tag 看起来没反应**：原来只调 `pixivSearch()`，但 Pixiv 页没有渲染
+  搜索结果的地方。现在 `openPixivSearch()` 一步做三件事：
+  切到搜索页「Pixiv插画」Tab + 写关键词 + 发起搜索。
+  配套把 `SearchTab` 从 Composable 局部 state 提升到 ViewModel
+- **画师卡片点击无响应**（`onClick = { }`）：现在进画师详情页
+  （头像 / 昵称 / ID / 作品数 / 双列作品网格，点作品进大图浏览器）。
+  数据走 `/ajax/user/<uid>/profile/all`（免登录，返回 ID 列表）
+  + `/ajax/illust/<id>` 逐条取详情，因为 `/ajax/user/<uid>/illusts` 要登录。
+  顺带修了 Compose 命中测试：卡片内层头像/昵称会截获点击，补 `clickable`
+- **配了代理但图片不走代理**：`PixivApplication.newImageLoader()` 不读
+  `Settings.proxyUrl`，导致 Pixiv 页文字能刷、图片全灰块。
+  改用 `DynamicProxySelector`（每次请求现读设置，改完立即生效，无需重启），
+  与 `PixivClient` 共用同一个代理解析函数
+- **20 处编译警告**：`Icons.Filled.*` → `Icons.AutoMirrored.Filled.*`、
+  多余 `?.` / `!!` / elvis、`Context()` 弃用（Rhino 1.7.15 唯一入口，
+  用 `@Suppress` + 注释说明）
+
+### 测试
+
+**343 个用例**（v0.7.0 是 322，净增 21），8 个联网用例默认跳过，**零警告**。
+
+- 新增 `V071RegressionTest`（18 条）：榜单/搜索状态隔离、
+  代理解析 6 种写法、垃圾代理退直连、真实 `rank_a` 夹具字段级断言
+- 真实夹具 `app/src/test/fixtures/novel_ranking_rank_a.html`
+  （从 2026-11-26 实测响应原样切出前 4 条）
+- 清理 `PixivTagWallDiagnosticTest`，核心断言并入 `PixivClientTest`
+
+---
+
+## [0.7.0] - 2026-11-26
+
+**Pixiv 端口 · 阅读器闭环 · 搜索并发**：Pixiv 能看能读能存原图，搜索不再卡，翻页是真的翻页。
+
+### 新增
+
+- **Pixiv 端口（免登录可用）**（`core/pixiv/`）：
+  - 插画 / 漫画榜：`ranking.php?mode=X&content=Y&format=json`
+  - 小说榜：抓 HTML 里的 `/novel/show.php?id=` 提 ID，再逐条取详情
+  - 搜索 / 相关 tag：`/ajax/search/top/<kw>`
+  - 作品详情与小说正文：`/ajax/illust/<id>`、`/ajax/novel/<id>`
+  - ⚠️ v0.6.0 计划的 `ajax/top/*` 实测要登录（403），**未使用**
+  - 图床 `Referer` 注入挂在 Coil 全局 `ImageLoader` 上
+  - 图片镜像可切换（官方直连 / 反代域名），API 镜像可在设置里填
+  - R18 榜单未登录时明确提示「去设置填 Cookie」，不返回空列表
+- **`PixivNovelParser`**：`[newpage]` → 空行、`[chapter:]` 拆章、
+  `[[rb:汉字>假名]]` → `汉字（假名）`、`[jump:]` 清除、`[pixivimage:]` → 占位
+- **大图浏览器**：双指缩放、多图画册左右滑、作者/标签/收藏数、
+  `MediaStore` 保存**原图**到相册
+- **搜索页四子 Tab**：书源小说 / Pixiv插画·漫画 / Pixiv小说 / Pixiv画师
+- **Tag 墙**：每个热门 tag 各取一张真实封面，点一下直接搜该 tag
+- **书源回归台账**（`SourceLedgerTest`）：离线静态检查 + `-DsourceLedger.online=true` 联网四段报告
+- **视觉改版**：Material 3 柔和浅紫体系（`#FAFAFC` 底 / `#EAE4FA` 选中胶囊 / `#6B5BD2` 主色）
+
+### 修复
+
+- **「保存原图」存的是缩略图**（449×960 / 682 KB）：
+  原图 URL 不能保留 `_master1200`（那是 `img-master` 的转码标记），
+  正解是 `img-original/.../152421696_p0.jpg` → 2805×6000 / 7.19 MB。
+  另加「2xx + 大小 > 1KB + PNG/JPEG 文件头」三道校验，
+  避免把 Pixiv 的 58 字节 404 JSON 存成 `.jpg`
+- **Tag 墙 16 个格子全灰**：封面原本从 `ps.illusts` 推断，
+  首次进入时该列表为空。改为每个 tag 搜一次、存进 `tagCovers`
+- **`LazyVerticalGrid` 内 `aspectRatio(1f)` 算出 0 高度** → 改固定 `height(160.dp)`
+- **搜索页切到「搜图片」再也切不回来**：
+  v0.6.0 把模式胶囊放进了 `if (mode == IMAGE) { ...; return }` 分支内
+- **搜索串行卡顿**：`for (src in enabled)` 全局 1000ms 间隔 →
+  按域名分组并发（同域串行 + 800ms，跨域 4 并发），并跳过体检硬失败的源
+- **R18 过滤失效**：搜索结果聚合前先过 `BookClassifier`，关开关时成人向进不了列表
+- **图片镜像重写误伤**：`rewrite()` 会把任意 http 地址换成镜像域名
+  （书源封面会被改到 `i.pixiv.re` 下必然 404）→ 加 `isPixivImage()` 前置判断
+
+### 变更
+
+- 阅读器：真左右翻页（`TextMeasurer` 精确分页）、点击左/中/右分区、
+  底部快捷面板（字号/行距/纸色/翻页）、正文插图 `AsyncImage`、章内页码精准恢复
+- 书城：跨源去重补全缺失封面/简介/字数、`altOrigins` 打通换源、
+  30 分钟快照缓存
+- 设置页 Pixiv 段：PHPSESSID / 代理 / 图片镜像 / API 镜像都可直接编辑
+  （v0.6.0 的两个「配置」按钮是空 lambda）
+
+### 测试
+
+**322 个用例**（v0.6.0 是 209，净增 113），11 个联网用例默认跳过：
+
+| 测试 | 数量 | 覆盖 |
+|---|---|---|
+| `PixivNovelParserTest` | 21 | 四类标记、拆章、边界 |
+| `PixivClientTest` | 30 | 真实响应解析、`rating_count`、镜像重写、拦截器 |
+| `PixivSaverTest` | 14 | 原图路径、图片头校验 |
+| `SearchConcurrencyTest` | 8 | 同域串行 / 跨域并行 / 全局上限 |
+| `Phase1EngineTest` | 24 | 分页、闸门、元数据合并、快照 |
+| `SourceLedgerTest` | 6 | 书源回归台账 |
+| `PixivOnlineTest` | 7 | 真联网哨兵 |
+| `PixivTagWallDiagnosticTest` | 3 | Tag 墙数据链路 |
+
+联网用法：
+```
+./gradlew testDebugUnitTest --tests "*PixivOnlineTest" -Dpixiv.online=true
+./gradlew testDebugUnitTest --tests "*SourceLedgerTest" -DsourceLedger.online=true
+```
 
 ---
 

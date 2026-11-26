@@ -34,7 +34,17 @@ fun ReaderViewModel.setAdultEnabled(enabled: Boolean) {
     notifySettingsChanged()
 }
 
-/** 书城首屏加载。 */
+/**
+ * 书城首屏加载。
+ *
+ * ### 顺序很重要
+ *
+ * 1. **先贴快照**（有的话）→ 用户立刻看到内容，不是空列表转圈
+ * 2. **再后台刷新** → 拉真实数据，成功后覆盖 + 更新快照
+ *
+ * 快照过期（>30min）也先用：过期的书城远好过一片空白。
+ * 刷新失败时保留快照，不清空 —— 断网时还能逛上次的内容。
+ */
 fun ReaderViewModel.loadBookstore(force: Boolean = false) {
     if (bookstoreState.loading) return
     if (bookstoreState.initialized && !force) return
@@ -42,6 +52,16 @@ fun ReaderViewModel.loadBookstore(force: Boolean = false) {
     bookstoreState.loading = true
     bookstoreState.errors = emptyList()
     viewModelScope.launch {
+        // ---- 1) 快照垫底 ----
+        val snapshot = withContext(Dispatchers.IO) {
+            com.ayanami.reader.core.bookstore.BookstoreSnapshot.load(repo.cacheDir)
+        }
+        if (snapshot != null && bookstoreState.allBooks.isEmpty()) {
+            bookstoreState.setBooks(snapshot.books, true)
+            // 标记"现在显示的是缓存"，让 UI 可以说一句
+            bookstoreState.fromSnapshot = !snapshot.isFresh
+        }
+
         val usable = withContext(Dispatchers.IO) {
             bookstoreEngine.usableSources(
                 sources = state.value.sources,
@@ -51,21 +71,33 @@ fun ReaderViewModel.loadBookstore(force: Boolean = false) {
         bookstoreState.updateSources(usable)
 
         if (usable.isEmpty()) {
-            bookstoreState.setBooks(emptyList(), false)
+            // 有快照就留着，没有才清空
+            if (bookstoreState.allBooks.isEmpty()) {
+                bookstoreState.setBooks(emptyList(), false)
+            }
             bookstoreState.loading = false
             bookstoreState.initialized = true
             return@launch
         }
 
         val page = withContext(Dispatchers.IO) {
-            bookstoreEngine.loadPage(
+            val p = bookstoreEngine.loadPage(
                 sources = usable,
                 adultOn = adultEnabled,
                 perSource = 20,
                 firstPage = true
             )
+            if (p.books.isNotEmpty()) {
+                com.ayanami.reader.core.bookstore.BookstoreSnapshot.save(repo.cacheDir, p.books)
+            }
+            p
         }
-        bookstoreState.setBooks(page.books, page.hasMore)
+
+        if (page.books.isNotEmpty()) {
+            bookstoreState.setBooks(page.books, page.hasMore)
+            bookstoreState.fromSnapshot = false
+        }
+        // 刷新回来是空的 → **保留快照内容**，不要把用户正在看的东西清掉
         bookstoreState.errors = page.errors
         bookstoreState.loading = false
         bookstoreState.initialized = true
@@ -104,10 +136,16 @@ fun ReaderViewModel.loadMoreBookstore() {
  * 不需要为书城再写一套详情/目录/正文逻辑。
  */
 fun ReaderViewModel.openHitFromBookstore(book: BookstoreEngine.StoreBook) {
+    // ⚠️ 必须带上 altOrigins —— 否则书城打开的书永远只有一个源，
+    // 详情页的「换源」入口就是空的，用户还得回搜索页重新搜一遍。
     val hit = AggregatedHit(
         name = book.book.name,
         author = book.book.author,
-        books = listOf(book.book)
+        books = listOf(book.book) + book.altOrigins.filter { it.origin != book.book.origin }
+    )
+    // 把聚合结果挂进 state.hits，让详情页的 alternateSources() 找得到
+    _state.value = _state.value.copy(
+        hits = (_state.value.hits.filterNot { it.name == hit.name && it.author == hit.author } + hit)
     )
     openHit(hit)
 }
@@ -133,14 +171,15 @@ fun ReaderViewModel.refreshBookstoreWithCheck() {
             c == null || c.status != SourceChecker.UiStatus.READABLE
         }
         if (checking.isNotEmpty()) {
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 2000L
             for (src in checking) {
                 val r = withContext(Dispatchers.IO) {
-                    SourceChecker.check(src, polite = true)
+                    com.ayanami.reader.core.net.HostGate.pace(
+                        src.bookSourceUrl,
+                        com.ayanami.reader.core.net.HostGate.checkIntervalMs
+                    ) { SourceChecker.check(src, polite = true) }
                 }
                 repo.saveCheckResult(r)
             }
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 0L
             reloadSources()
         }
         bookstoreEngine.reset()

@@ -31,16 +31,41 @@ data class ReaderTokens(
     val contentPadding: androidx.compose.ui.unit.Dp = 22.dp
 )
 
+/**
+ * 默认令牌：Material 3 柔和浅紫 + 极简留白。
+ *
+ * 为什么换成浅紫而不是原来的暖灰：整 App 的品牌色偏暖灰时，
+ * 「选中态」只能靠加粗/描边区分，视觉上找不到焦点。
+ * 浅紫（`#6B5BD2`）在浅灰白底（`#FAFAFC`）上有明确的色相差异，
+ * 同时饱和度足够低，不会像亮蓝那样刺眼。
+ *
+ * 三档色彩各有分工（对应 PixivViewer 的胶囊体系）：
+ * - [primary] 深紫：选中态文字/图标、强调按钮
+ * - [surfaceTint] 浅紫底：选中态胶囊背景
+ * - [pillIdle] 浅灰底：未选中态胶囊背景
+ */
 val LocalReaderTokens = staticCompositionLocalOf {
     ReaderTokens(
-        background = Color(0xFFF7F6F3),
+        background = Color(0xFFFAFAFC),
         surface = Color(0xFFFFFFFF),
-        textPrimary = Color(0xFF1A1A1A),
-        textSecondary = Color(0xFF8A8A8E),
-        primary = Color(0xFF3B6FE0),
+        textPrimary = Color(0xFF1F1D2B),
+        textSecondary = Color(0xFF8B88A0),
+        primary = Color(0xFF6B5BD2),
         accent = Color(0xFFE8622C)
     )
 }
+
+/**
+ * 胶囊体系的两种底色。
+ *
+ * 单独抽出来而不是塞进 [ReaderTokens]：MOD 主题只该换主色，
+ * 不该让 MOD 有机会把选中/未选中做得看不出区别。
+ */
+val PillSelectedBg = Color(0xFFEAE4FA)
+val PillIdleBg = Color(0xFFF1F0F5)
+
+/** 卡片浅紫底（用于「特辑」这类强调卡片）。 */
+val CardTint = Color(0xFFF5F3FA)
 
 val DarkTokens = ReaderTokens(
     background = Color(0xFF121212),

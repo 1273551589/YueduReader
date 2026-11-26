@@ -52,7 +52,7 @@ class PersistedCompatTest {
         assertNotNull("带 error 的旧格式不应解析成 null（这会让整表丢失）", m)
         // 注意：Gson 在 JSON 对象的 value 缺字段时仍能建对象，
         // 但这里 map 的 key 来自 JSON 的 key，不该是 null。
-        println("DEBUG keys=" + m!!.keys.map { it ?: "NULL" })
+        println("DEBUG keys=" + m!!.keys.joinToString("|"))
         assertEquals("两个源都应保留", 2, m.size)
 
         val r1 = m["s1"]!!.toResult()

@@ -50,6 +50,9 @@ class BookstoreState {
     /** 是否已做过首屏加载。 */
     var initialized by mutableStateOf(false)
 
+    /** 当前列表是否来自过期快照（UI 借此提示"显示的是上次缓存"）。 */
+    var fromSnapshot by mutableStateOf(false)
+
     fun setBooks(books: List<BookstoreEngine.StoreBook>, more: Boolean) {
         allBooks = books
         hasMore = more

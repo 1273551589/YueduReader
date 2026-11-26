@@ -100,6 +100,26 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_PROXY, "") ?: ""
         set(v) = prefs.edit().putString(KEY_PROXY, v).apply()
 
+    /**
+     * Pixiv 图床镜像域名。
+     *
+     * 默认 `i.pximg.net`（官方，需 Referer）。国内网络直连不稳时
+     * 可切到反代域名，见 [com.ayanami.reader.core.pixiv.PixivImageUrls.KNOWN_MIRRORS]。
+     */
+    var pixivImageMirror: String
+        get() = prefs.getString(KEY_PIXIV_MIRROR, "i.pximg.net") ?: "i.pximg.net"
+        set(v) = prefs.edit().putString(KEY_PIXIV_MIRROR, v.trim()).apply()
+
+    /**
+     * Pixiv API 镜像前缀（自建反代时填）。
+     *
+     * 留空 = 直连 `https://www.pixiv.net`。填了就必须是完整前缀，
+     * 例如 `https://px.example.com`。
+     */
+    var pixivApiBase: String
+        get() = prefs.getString(KEY_PIXIV_API_BASE, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_PIXIV_API_BASE, v.trim().trimEnd('/')).apply()
+
     // ---------------- 纯函数：可见性判定 ----------------
 
     /**
@@ -152,5 +172,7 @@ class Settings(context: Context) {
         private const val KEY_PIXIV_COOKIE = "pixiv_cookie"
         private const val KEY_PIXIV_TOKEN = "pixiv_token"
         private const val KEY_PROXY = "proxy_url"
+        private const val KEY_PIXIV_MIRROR = "pixiv_image_mirror"
+        private const val KEY_PIXIV_API_BASE = "pixiv_api_base"
     }
 }

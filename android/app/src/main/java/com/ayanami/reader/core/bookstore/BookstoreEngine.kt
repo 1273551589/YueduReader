@@ -41,14 +41,28 @@ class BookstoreEngine(
     private val scope: CoroutineScope
 ) {
 
-    /** 一本书在书城里的完整形态（含本地算出来的分类）。 */
+    /**
+     * 一本书在书城里的完整形态（含本地算出来的分类）。
+     *
+     * @param altOrigins 同一本书在其他源上的命中。
+     *   详情页据此给出「换源」入口 —— 当前源的正文有防盗乱码或缺章时，
+     *   用户不用重新搜一遍。**这一栏以前是空的**：去重时后到的条目
+     *   直接被丢弃，跨源信息就丢了。
+     */
     data class StoreBook(
         val book: SearchBook,
         val classification: BookClassifier.Result,
         /** 该条目来自哪个分类的发现页（便于按分类跳转） */
-        val categoryHint: String = ""
+        val categoryHint: String = "",
+        val altOrigins: List<SearchBook> = emptyList()
     ) {
         val id: String get() = "${book.origin}\u0000${book.bookUrl}"
+
+        /** 可切换的其他源（去重，排除自己）。 */
+        val switchableOrigins: List<SearchBook>
+            get() = altOrigins
+                .filter { it.origin != book.origin && it.bookUrl.isNotBlank() }
+                .distinctBy { it.origin }
     }
 
     /** 一个可逛的书源：已通过体检 + 有发现页或能做搜索。 */
@@ -137,8 +151,16 @@ class BookstoreEngine(
         }
         jobs.awaitAll()
 
-        // 跨源去重：同一本书在多个源出现时只留一条。
-        // 保留**首次出现**的那条 —— 先到的源往往封面/简介更完整。
+        // 跨源合并：同一本书在多个源出现时只留一条，但**不丢弃后到的元数据**。
+        //
+        // v0.6.0 是直接丢弃后到的条目 —— 后果是：先到的源封面是空的，
+        // 后面那个源明明有封面，用户看到的却是彩色占位块；换源入口也没有，
+        // 因为 altOrigins 从来没被填过。
+        //
+        // 现在的规则：
+        // - 用**首条**做主体（先到的源往往排序更相关）
+        // - 缺的字段（封面/简介/字数/最新章节/分类）用后续条目补齐
+        // - 所有来源记进 altOrigins，去重后给详情页做换源
         val merged = ArrayList<StoreBook>()
         val addedIds = HashSet<String>()
         for (b in collected) {
@@ -147,8 +169,13 @@ class BookstoreEngine(
             if (existing == null) {
                 seenLock.withLock { seen[key] = b }
                 if (addedIds.add(b.id)) merged.add(b)
-            } else if (addedIds.add(existing.id)) {
-                merged.add(existing)
+            } else {
+                // 已有同书条目 → 合并元数据 + 追加 origin
+                val better = existing.mergedWith(b)
+                seenLock.withLock { seen[key] = better }
+                // 用 id 找到列表里那条并替换（不能只 replace，id 可能已变）
+                val idx = merged.indexOfFirst { it.id == existing.id }
+                if (idx >= 0) merged[idx] = better
             }
         }
 
@@ -157,6 +184,30 @@ class BookstoreEngine(
         }
 
         Page(books = merged.distinctBy { it.id }, errors = errors.toList(), hasMore = hasMore)
+    }
+
+    /**
+     * 合并两条同书条目。
+     *
+     * **缺失字段才补** —— 已有值不覆盖。理由：先到的源排序更相关，
+     * 它的书名/作者更可能是用户想要的形态（比如"全本"后缀不是先到的那个）。
+     * 但空值一定要补，否则界面上就是一块空缺。
+     */
+    internal fun StoreBook.mergedWith(other: StoreBook): StoreBook {
+        val a = this.book
+        val b = other.book
+        val mergedBook = a.copy(
+            coverUrl = a.coverUrl?.takeIf { it.isNotBlank() } ?: b.coverUrl,
+            intro = a.intro?.takeIf { it.isNotBlank() } ?: b.intro,
+            wordCount = a.wordCount?.takeIf { it.isNotBlank() } ?: b.wordCount,
+            kind = a.kind?.takeIf { it.isNotBlank() } ?: b.kind,
+            lastChapter = a.lastChapter?.takeIf { it.isNotBlank() } ?: b.lastChapter,
+            updateTime = a.updateTime?.takeIf { it.isNotBlank() } ?: b.updateTime
+        )
+        val origins = (altOrigins + b)
+            .filter { it.origin != mergedBook.origin }
+            .distinctBy { it.origin }
+        return copy(book = mergedBook, altOrigins = origins)
     }
 
     private suspend fun fetchOne(

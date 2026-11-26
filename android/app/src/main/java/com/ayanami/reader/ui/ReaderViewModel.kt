@@ -1,5 +1,7 @@
 package com.ayanami.reader.ui
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -12,11 +14,17 @@ import com.ayanami.reader.core.pipeline.SourceChecker
 import com.ayanami.reader.core.pipeline.SourceImporter
 import com.ayanami.reader.core.pipeline.SourceSession
 import com.ayanami.reader.core.bookstore.BookstoreEngine
+import com.ayanami.reader.core.classify.BookClassifier
 import com.ayanami.reader.core.download.DownloadEngine
+import com.ayanami.reader.core.net.HostGate
 import com.ayanami.reader.data.Repository
 import com.ayanami.reader.data.Settings
 import com.ayanami.reader.mod.ModLoader
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import androidx.lifecycle.viewModelScope
@@ -41,6 +49,12 @@ data class ReaderUiState(
     val searching: Boolean = false,
     val hits: List<AggregatedHit> = emptyList(),
     val searchErrors: List<Pair<String, String>> = emptyList(),
+    /** 本次搜索实际发起了几个源（跳过的源不计入）。 */
+    val searchSourceCount: Int = 0,
+    /** 因体检失败/未验证而被跳过的源数。 */
+    val searchSkippedCount: Int = 0,
+    /** 已被 R18 硬过滤掉的书名数（让用户知道过滤真的生效了）。 */
+    val searchAdultFilteredCount: Int = 0,
     val openedBook: Book? = null,
     val toc: List<BookChapter> = emptyList(),
     val loadingToc: Boolean = false,
@@ -83,6 +97,52 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     internal fun setRecentReading(list: List<RecentReading>) {
         recentReadingState.value = list
     }
+
+    /**
+     * 当前搜索任务。
+     *
+     * 有了它才能「重新搜索时取消上一次」—— 否则用户改关键词连按两次，
+     * 上一次的慢源结果会覆盖这一次的，看起来像搜错了。
+     */
+    private var searchJob: Job? = null
+
+    /** Pixiv 页 UI 状态（标签、榜单、大图、小说）。 */
+    val pixivState = PixivUiState()
+
+    /**
+     * 搜索页当前子 Tab。
+     *
+     * 放在 VM 而不是 Composable 局部 state —— Pixiv 页点 Tag 需要
+     * 「跳到搜索页 + 切到插画 Tab + 填入关键词」，三件事必须原子地一起发生。
+     */
+    var searchTab by androidx.compose.runtime.mutableStateOf(SearchTab.SOURCE)
+
+    /**
+     * 从其他页面发起一次 Pixiv 搜索（点 Tag、点相关标签用）。
+     *
+     * 一步做三件事：切 Tab、写关键词、发起搜索。
+     * 这样调用方只需要 `openPixivSearch("VOCALOID")`，不会漏掉任何一步。
+     */
+    fun openPixivSearch(
+        keyword: String,
+        mode: PixivSearchMode = PixivSearchMode.ILLUST
+    ) {
+        searchTab = when (mode) {
+            PixivSearchMode.ILLUST -> SearchTab.PIXIV_ILLUST
+            PixivSearchMode.NOVEL -> SearchTab.PIXIV_NOVEL
+            PixivSearchMode.USER -> SearchTab.PIXIV_USER
+        }
+        searchKeywordBridge = keyword
+        pixivSearch(keyword, mode)
+    }
+
+    /**
+     * 外部注入的关键词（供搜索页初始化输入框）。
+     *
+     * 用独立字段而不是 `pixivState.keyword`：后者是"上次搜了什么"，
+     * 而这个是"这次要填进输入框什么"，语义不同。
+     */
+    var searchKeywordBridge by androidx.compose.runtime.mutableStateOf("")
 
     /** 书城页 UI 状态。 */
     val bookstoreState = BookstoreState().also {
@@ -200,15 +260,24 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 全量重测：**串行**跑，不为速度牺牲礼貌（方案 §3.2.5）。 */
+    /**
+     * 全量重测：**串行**跑，不为速度牺牲礼貌（方案 §3.2.5）。
+     *
+     * 只把「同 host 的间隔」交给 [HostGate.pace]，不再动
+     * `HttpFetcher` 的全局变量 —— 那个变量以前会被设成 3000ms 却忘了复位，
+     * 之后用户去读书，每一章都要多等 3 秒。
+     */
     fun checkAll() {
         if (_state.value.checkingAll) return
         viewModelScope.launch {
             val list = _state.value.sources.filter { it.bookSourceEnabled }
             _state.value = _state.value.copy(checkingAll = true, checkProgress = 0 to list.size)
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 3000L
             for ((i, src) in list.withIndex()) {
-                val r = withContext(Dispatchers.IO) { SourceChecker.check(src, polite = true) }
+                val r = withContext(Dispatchers.IO) {
+                    HostGate.pace(src.bookSourceUrl, HostGate.checkIntervalMs) {
+                        SourceChecker.check(src, polite = true)
+                    }
+                }
                 repo.saveCheckResult(r)
                 _state.value = _state.value.copy(
                     checks = repo.loadCheckResults(),
@@ -216,46 +285,117 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                     checkProgress = (i + 1) to list.size
                 )
             }
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 0L
             _state.value = _state.value.copy(checkingAll = false, checkProgress = null)
-            toast("体检完成")
+            toast("体检完成：${repo.loadCheckResults().values.count {
+                it.status == SourceChecker.UiStatus.READABLE
+            }}/${list.size} 可读")
         }
     }
 
     // ---------------- 搜索 ----------------
 
+    /**
+     * 跨源搜索。
+     *
+     * ### 并发策略
+     *
+     * 按域名分组并发（[HostGate.run]）：同域名串行 + 800ms 礼貌间隔，
+     * 跨域名最多 4 个同时在跑。这跟 v0.6.0 的 `for (src in enabled)` 串行
+     * 有本质差别 —— 20 个源的总耗时从「累加」变成「最慢那一档」。
+     *
+     * 为什么必须按域名而不是无脑铺开：大量书源其实同属一个站
+     * （同一域名下不同频道），并发打同一个站既是找封，也没意义。
+     *
+     * ### 跳过无效源
+     *
+     * 体检明确失败（连接失败 / 需登录 / 不支持）的源直接跳过，
+     * 不再浪费时间等它超时。未体检（UNVERIFIED）的源仍然搜 ——
+     * 很多人导入书源就直接用，不该逼他们先跑体检。
+     */
     fun search(keyword: String) {
         if (keyword.isBlank()) return
-        viewModelScope.launch {
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch {
             _state.value = _state.value.copy(
-                keyword = keyword, searching = true, hits = emptyList(), searchErrors = emptyList()
+                keyword = keyword,
+                searching = true,
+                hits = emptyList(),
+                searchErrors = emptyList(),
+                searchSourceCount = 0,
+                searchSkippedCount = 0,
+                searchAdultFilteredCount = 0
             )
-            val enabled = _state.value.sources.filter { it.bookSourceEnabled }
-            val all = ArrayList<SearchBook>()
-            val errors = ArrayList<Pair<String, String>>()
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 1000L
-            for (src in enabled) {
-                val s = SourceSession(src, polite = true)
-                val r = withContext(Dispatchers.IO) {
-                    runCatching { s.search(keyword) }.getOrElse { emptyList() }
-                }
-                if (r.isEmpty()) {
-                    errors.add(src.bookSourceName to (s.lastError?.humanMessage ?: "无结果"))
-                } else all.addAll(r)
-            }
-            com.ayanami.reader.core.net.HttpFetcher.minIntervalPerHostMs = 0L
 
-            // 跨源聚合：同名+同作者 视为同一本
+            val all = _state.value.sources.filter { it.bookSourceEnabled }
+            val skipCount = _state.value.checks.count { (url, r) ->
+                all.any { it.bookSourceUrl == url } && r.status.isHardFailure
+            }
+            val enabled = all.filter { src ->
+                _state.value.checks[src.bookSourceUrl]?.status?.isHardFailure != true
+            }
+
+            val raw = ArrayList<SearchBook>()
+            val errors = java.util.Collections.synchronizedList(ArrayList<Pair<String, String>>())
+
+            // 按域名分组：同一 host 的源在同一个协程里顺序跑
+            val byHost = enabled.groupBy { HostGate.hostOf(it.bookSourceUrl) }
+            coroutineScope {
+                byHost.map { (_, group) ->
+                    async(Dispatchers.IO) {
+                        for (src in group) {
+                            val gateUrl = src.bookSourceUrl.ifBlank { "unknown://${src.bookSourceName}" }
+                            val s = SourceSession(src, polite = true)
+                            val r = runCatching {
+                                HostGate.run(gateUrl, HostGate.searchIntervalMs) {
+                                    s.search(keyword)
+                                }
+                            }.getOrElse { emptyList() }
+                            if (r.isEmpty()) {
+                                errors.add(src.bookSourceName to (s.lastError?.humanMessage ?: "无结果"))
+                            } else {
+                                synchronized(raw) { raw.addAll(r) }
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            val adultOn = settings.adultEnabled
+            val filteredAdult = java.util.concurrent.atomic.AtomicInteger(0)
+
+            // 跨源聚合：同名+同作者 视为同一本。
+            // R18 硬过滤在**聚合之前**做 —— 否则关了开关还能从「其他源」
+            // 那一栏看到成人书名。
             val grouped = LinkedHashMap<String, MutableList<SearchBook>>()
-            all.forEach { b ->
+            raw.forEach { b ->
+                if (!adultOn) {
+                    val cls = BookClassifier.classify(
+                        name = b.name,
+                        author = b.author,
+                        intro = b.intro,
+                        kindRaw = b.kind,
+                        sourceGroup = _state.value.sources
+                            .firstOrNull { it.bookSourceUrl == b.origin }?.bookSourceGroup
+                    )
+                    if (cls.isAdult) {
+                        filteredAdult.incrementAndGet()
+                        return@forEach
+                    }
+                }
                 grouped.getOrPut(b.stableKey) { ArrayList() }.add(b)
             }
-            val hits = grouped.values.mapNotNull { list ->
+            val hits = grouped.values.map { list ->
                 val first = list.first()
                 AggregatedHit(first.name, first.author, list)
             }
+
             _state.value = _state.value.copy(
-                searching = false, hits = hits, searchErrors = errors
+                searching = false,
+                hits = hits,
+                searchErrors = errors.toList(),
+                searchSourceCount = enabled.size,
+                searchSkippedCount = skipCount,
+                searchAdultFilteredCount = filteredAdult.get()
             )
         }
     }

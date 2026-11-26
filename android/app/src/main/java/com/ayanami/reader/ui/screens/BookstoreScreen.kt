@@ -100,8 +100,13 @@ fun BookstoreScreen(
         StatusBarSpacer()
         ScreenHeader(
             title = "书城",
-            subtitle = if (bs.sources.isEmpty()) "没有可逛的书源" else
-                "${bs.sources.size} 个可读源 · ${visible.size} 本"
+            // 显示的是过期快照时要讲明白 —— 否则用户会以为「怎么书都不更新」
+            subtitle = when {
+                bs.sources.isEmpty() && bs.allBooks.isEmpty() -> "没有可逛的书源"
+                bs.fromSnapshot -> "上次的缓存 · ${visible.size} 本 · 正在后台刷新"
+                bs.loading && bs.allBooks.isNotEmpty() -> "缓存 ${visible.size} 本 · 刷新中"
+                else -> "${bs.sources.size} 个可读源 · ${visible.size} 本"
+            }
         )
 
         // ---- 第 1 排：主分类 ----

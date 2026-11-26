@@ -146,7 +146,7 @@ class JsRuntime(
         is org.mozilla.javascript.NativeArray -> {
             val n = v.length.toInt()
             (0 until n).joinToString("\n") { i ->
-                stringify(ScriptableObject.getProperty(v, i.toInt()))
+                stringify(ScriptableObject.getProperty(v, i))
             }
         }
         is org.mozilla.javascript.Scriptable -> Context.toString(v)

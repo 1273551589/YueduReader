@@ -137,8 +137,11 @@ class SfacgEndToEndTest {
         val mod = r.mods.first()
         assertEquals("my-theme", mod.manifest.id)
         assertEquals(ModLoader.ModType.theme, mod.manifest.type)
-        assertEquals(12f, mod.theme!!.cornerRadius)
-        assertTrue(mod.theme!!.primary != null)
+        // 先断言非空再访问 —— 这样既没有「unnecessary !!」警告，
+        // 又不会因为编译器认为它可空而报错
+        val theme = requireNotNull(mod.theme) { "主题 MOD 应解析出 theme" }
+        assertEquals(12f, theme.cornerRadius)
+        assertTrue(theme.primary != null)
     }
 
     @Test

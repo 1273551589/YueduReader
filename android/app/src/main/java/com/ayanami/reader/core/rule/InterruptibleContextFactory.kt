@@ -47,6 +47,13 @@ object InterruptibleContextFactory {
     /** 本次执行对应的 context，供外层超时后直接打断。 */
     private val currentContextHolder = ThreadLocal<InterruptibleContext?>()
 
+    /**
+     * ⚠️ `Context()` 无参构造在 Rhino 1.9+ 被标记为 deprecated，
+     * 但 1.7.15（我们钉住的版本，为了 Java 8 字节码兼容）**只有**这一个入口。
+     * 换成 `Context(compileTimeAddingCapacity)` 那种带参构造会改变脚本语义。
+     * 所以这里显式抑制，并把理由写在这里，免得以后有人「顺手改掉」。
+     */
+    @Suppress("DEPRECATION")
     class InterruptibleContext(budgetMs: Long) : Context() {
         @Volatile
         var cancelled: Boolean = false

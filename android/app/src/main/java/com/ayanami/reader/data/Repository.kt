@@ -26,6 +26,9 @@ class Repository(private val context: Context) {
     private val progressFile: File by lazy { File(dir, "progress.json") }
     val modsDir: File by lazy { File(dir, "mods").apply { mkdirs() } }
 
+    /** 书城快照等缓存文件的落脚目录。 */
+    val cacheDir: File by lazy { File(dir, "cache").apply { mkdirs() } }
+
     val gson = com.ayanami.reader.core.rule.LenientJson.lenient
 
     // ---------------- 书源 ----------------
@@ -127,21 +130,53 @@ class Repository(private val context: Context) {
      *
      * @param bookName 书名。**必须带**，否则书架「最近阅读」只能显示 URL 尾巴，
      *   用户根本认不出是哪本书。旧版本没存这个字段，所以读侧做了兜底。
+     * @param pageIndex 章内页码（翻页模式）。滚动模式填 -1。
+     * @param scrollOffset 章内滚动像素（滚动模式）。翻页模式填 0。
+     *
+     * 为什么页内位置也要存：只记章节的话，一章 8000 字读到 90% 再退出，
+     * 回来还是从章首开始 —— 用户得再翻十几页。这是"精准恢复"的核心。
      */
     fun saveProgress(
         bookUrl: String,
         chapterIndex: Int,
         chapterTitle: String,
-        bookName: String = ""
+        bookName: String = "",
+        pageIndex: Int = -1,
+        scrollOffset: Int = 0
     ) {
         val map = loadProgress()
         map[bookUrl] = mapOf(
             "index" to chapterIndex,
             "title" to chapterTitle,
             "name" to bookName,
-            "time" to System.currentTimeMillis()
+            "time" to System.currentTimeMillis(),
+            "page" to pageIndex,
+            "offset" to scrollOffset
         )
         progressFile.writeText(gson.toJson(map))
+    }
+
+    /** 单本书的进度快照。读不出来时各字段给安全默认值。 */
+    data class Progress(
+        val chapterIndex: Int = 0,
+        val chapterTitle: String = "",
+        val bookName: String = "",
+        val pageIndex: Int = -1,
+        val scrollOffset: Int = 0,
+        val updatedAt: Long = 0L
+    )
+
+    /** 读某本书的进度；没有记录返回 null。 */
+    fun loadProgressOf(bookUrl: String): Progress? {
+        val m = loadProgress()[bookUrl] ?: return null
+        return Progress(
+            chapterIndex = (m["index"] as? Number)?.toInt() ?: 0,
+            chapterTitle = (m["title"] as? String) ?: "",
+            bookName = (m["name"] as? String) ?: "",
+            pageIndex = (m["page"] as? Number)?.toInt() ?: -1,
+            scrollOffset = (m["offset"] as? Number)?.toInt() ?: 0,
+            updatedAt = (m["time"] as? Number)?.toLong() ?: 0L
+        )
     }
 
     fun loadProgress(): MutableMap<String, Map<String, Any>> {

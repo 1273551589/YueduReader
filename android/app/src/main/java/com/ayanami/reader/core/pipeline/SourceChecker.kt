@@ -30,7 +30,20 @@ object SourceChecker {
         NO_CONTENT("未取到正文"),
         NEEDS_LOGIN("需登录或人机验证"),
         UNSUPPORTED("当前执行端不支持"),
-        UNVERIFIED("未完成验证")
+        UNVERIFIED("未完成验证");
+
+        /**
+         * 这个状态是否意味着「再搜也没用」。
+         *
+         * 连接失败 / 需登录 / 执行端不支持 —— 三者的共同点是**不是运气问题**：
+         * 站点挂了、要账号、要 WebView，重搜 100 次也是同一个结果。
+         * 搜索时直接跳过这些源，省掉每个源 15 秒超时的等待。
+         *
+         * `NO_CONTENT` 故意**不算**：那只说明某次抽样没取到正文，
+         * 换个关键词很可能就有。`UNVERIFIED` 更不算 —— 没体检过不等于坏。
+         */
+        val isHardFailure: Boolean
+            get() = this == CONNECT_FAILED || this == NEEDS_LOGIN || this == UNSUPPORTED
     }
 
     data class CheckResult(
