@@ -15,6 +15,15 @@ import org.jsoup.nodes.Element
  * - 三个规则缓存是实例字段
  *
  * 所以上层 `SourceSession` 在 搜索 / 详情 / 目录 / 正文 四个阶段各 new 一个实例。
+ *
+ * ### v0.4.0 重写要点
+ *
+ * 1. **默认选择器语法**（`class.` / `id.` / `tag.` / `text.` / `children`）
+ *    交给 [RuleSteps] 求值，不再直接丢给 `jsoup.select()`。
+ * 2. **`@` 链式逐级下钻** —— 按 `@` 切成 N 段依次过滤，只有末段是取值符
+ *    （`text` / `html` / `href` / `src` / `ownText` …）时才做字符串提取。
+ *    旧实现 `indexOf('@')` 只认第一段，`class.odd.0@tag.a@href` 必然为空。
+ * 3. **后缀脚本 `<js>`** —— `规则主体<js>脚本</js>`，前段结果作为 `result` 注入。
  */
 class AnalyzeRule {
 
@@ -45,10 +54,8 @@ class AnalyzeRule {
      */
     var onRuleError: ((RuleError) -> Unit)? = null
 
-    /** 上游缺陷复刻：只有 true，没有复位。 */
-    private var isRegex = false
-
     private val ruleCache = HashMap<String, ParsedRule>()
+    private val stepCache = HashMap<String, RuleSteps.Spec>()
 
     var lastError: RuleError? = null
 
@@ -97,6 +104,9 @@ class AnalyzeRule {
         lastError = null
         return try {
             evalString(ruleStr)
+        } catch (e: RuleSteps.BadSelectorException) {
+            lastError = RuleError.RuleSyntaxError(e.selector).also { onRuleError?.invoke(it) }
+            null
         } catch (e: Exception) {
             lastError = RuleError.RuleSyntaxError(ruleStr).also { onRuleError?.invoke(it) }
             null
@@ -108,6 +118,9 @@ class AnalyzeRule {
         lastError = null
         return try {
             evalStringList(ruleStr)
+        } catch (e: RuleSteps.BadSelectorException) {
+            lastError = RuleError.RuleSyntaxError(e.selector).also { onRuleError?.invoke(it) }
+            null
         } catch (e: Exception) {
             lastError = RuleError.RuleSyntaxError(ruleStr).also { onRuleError?.invoke(it) }
             null
@@ -120,7 +133,15 @@ class AnalyzeRule {
         if (ruleStr.isNullOrEmpty()) return emptyList()
         val parsed = parse(ruleStr)
         return when (parsed.type) {
-            RuleType.Css, RuleType.Default -> queryCss(parsed.rule)
+            RuleType.Css, RuleType.Default -> try {
+                val steps = RuleSteps.splitSteps(parsed.rule)
+                val sel = RuleSteps.selectorSteps(steps)
+                selectSteps(sel.map { it.trim() })
+            } catch (e: RuleSteps.BadSelectorException) {
+                lastError = RuleError.RuleSyntaxError(e.selector)
+                    .also { onRuleError?.invoke(it) }
+                emptyList()
+            }
             RuleType.XPath -> queryXPath(parsed.rule)
             RuleType.Json, RuleType.Js -> emptyList()
         }
@@ -131,9 +152,18 @@ class AnalyzeRule {
     private fun parse(ruleStr: String): ParsedRule =
         ruleCache.getOrPut(ruleStr) { RuleAnalyzer.parsePrefix(ruleStr) }
 
+    private fun specOf(step: String): RuleSteps.Spec =
+        stepCache.getOrPut(step) { RuleSteps.parse(step) }
+
     private fun evalString(ruleStr: String): String {
         val trimmed = ruleStr.trim()
         if (trimmed.isEmpty()) return ""
+
+        // 0) 后缀脚本 `主体<js>脚本</js>` —— 前段结果注入 result
+        splitSuffixJs(trimmed)?.let { (body, script) ->
+            val base = if (body.isBlank()) "" else evalString(body)
+            return runJs(script, initialResult = base)
+        }
 
         // 1) `&&` / `||` 组合
         val split = RuleAnalyzer.splitRule(trimmed)
@@ -155,6 +185,21 @@ class AnalyzeRule {
         }
 
         return evalSingle(trimmed)
+    }
+
+    /**
+     * 拆 `规则主体<js>脚本</js>`。
+     *
+     * 只认**末尾**那一段 —— 开头就是 `<js>` 的走 [RuleAnalyzer.parsePrefix] 的老路径。
+     */
+    private fun splitSuffixJs(rule: String): Pair<String, String>? {
+        val open = rule.indexOf("<js>", ignoreCase = true)
+        if (open <= 0) return null
+        val close = rule.lastIndexOf("</js>", ignoreCase = true)
+        if (close < open) return null
+        val body = rule.substring(0, open)
+        val script = rule.substring(open + 4, close)
+        return body to script
     }
 
     /**
@@ -186,7 +231,7 @@ class AnalyzeRule {
         val rule = interpolate(parsed.rule)
 
         val value: String = when (parsed.type) {
-            RuleType.Css, RuleType.Default -> cssFirst(rule)
+            RuleType.Css, RuleType.Default -> cssValue(rule, parsed.rule)
             RuleType.Json -> jsonFirst(rule)
             RuleType.XPath -> xpathFirst(rule)
             RuleType.Js -> runJs(parsed.rule)
@@ -209,12 +254,87 @@ class AnalyzeRule {
     }
 
     /**
+     * CSS 链求值。
+     *
+     * @param rule       插值后的规则（`{{key}}` 已替换）
+     * @param unparsed   原始规则 —— 插值可能把变量插进选择器里，导致
+     *                   末段判断不同；这里以插值后的为准，unparsed 只在
+     *                   插值后为空时兜底。
+     */
+    private fun cssValue(rule: String, unparsed: String): String {
+        val effective = if (rule.isNotBlank()) rule else unparsed
+        val steps = RuleSteps.splitSteps(effective).map { it.trim() }
+        if (steps.isEmpty()) return ""
+
+        // 末段是取值符 → 前 N-1 段选择器
+        val extractor = RuleSteps.extractorOf(steps)
+        val selectorSteps = if (extractor != null) steps.dropLast(1) else steps
+        val attr = extractor ?: "text"
+
+        val selected = selectSteps(selectorSteps)
+
+        // 末段不是已知取值符时，允许"退一步当属性名"：
+        // class.book.0@title 这种（title 既是标签名也是属性）
+        if (extractor == null && selectorSteps.size > 1) {
+            val last = selectorSteps.last()
+            if (isPlainWord(last) && selected.isEmpty()) {
+                val parent = selectSteps(selectorSteps.dropLast(1))
+                val el = parent.firstOrNull()
+                if (el != null && el.hasAttr(last)) return extractAttr(el, last)
+            }
+        }
+
+        for (el in selected) {
+            val v = extractAttr(el, attr)
+            if (v.isNotEmpty()) return v
+        }
+        return ""
+    }
+
+    private fun isPlainWord(s: String): Boolean =
+        s.isNotEmpty() && s.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == ':' }
+
+    /** 依次应用选择器链，返回最终元素集合。 */
+    private fun selectSteps(steps: List<String>): List<Element> {
+        val roots = when {
+            element != null -> listOf(element!!)
+            document != null -> listOf(document!!)
+            else -> emptyList()
+        }
+        if (roots.isEmpty()) return emptyList()
+
+        // 全空选择器链（`@text` 这种）→ 作用在根节点
+        if (steps.isEmpty() || steps.all { it.isBlank() }) return roots
+
+        var current: List<Element> = roots
+        for (raw in steps) {
+            if (raw.isBlank()) continue
+            val spec = specOf(raw)
+            current = applySpec(spec, current)
+            if (current.isEmpty()) return emptyList()
+        }
+        return current
+    }
+
+    private fun applySpec(spec: RuleSteps.Spec, input: List<Element>): List<Element> {
+        val base = when (spec.accessor) {
+            "children" -> input.flatMap { it.children() }
+            "class" -> Elements2.byClass(input, spec.arg)
+            "id" -> Elements2.byId(input, spec.arg)
+            "tag" -> Elements2.byTag(input, spec.arg)
+            "text" -> Elements2.byText(input, spec.arg)
+            else -> Elements2.byCss(input, spec.arg)
+        }
+        return Elements2.applyFilters(spec, base)
+    }
+
+    /**
      * 执行 `@js` 规则。
      *
      * `result` 变量是 Legado 的约定：脚本里写 `result = "xxx"` 就是返回值。
      * 没赋值时取脚本最后一个表达式的结果。
      */
-    private fun runJs(script: String): String {
+    private fun runJs(script: String, initialResult: String? = null): String {
         val rt = jsRuntime
         if (rt == null) {
             lastError = RuleError.UnsupportedApi("@js（当前上下文没有 JS 运行时）")
@@ -225,7 +345,7 @@ class AnalyzeRule {
         // 把当前内容与已有变量喂进去
         val payload: Any? = element ?: document ?: json
         rt.bindVar("baseUrl", baseUrl)
-        rt.bindVar("result", "")
+        rt.bindVar("result", initialResult ?: "")
 
         val out = rt.eval(script, payload, baseUrl)
 
@@ -272,73 +392,7 @@ class AnalyzeRule {
         return sb.toString()
     }
 
-    // ---------------- CSS ----------------
-
-    private fun cssFirst(ruleRaw: String): String {
-        val atIdx = findAttrSeparator(ruleRaw)
-        val selectorPart = if (atIdx >= 0) ruleRaw.substring(0, atIdx) else ruleRaw
-        val attr = if (atIdx >= 0) ruleRaw.substring(atIdx + 1) else "text"
-
-        var selector = selectorPart.trim()
-
-        // 纯 `@text` / `@href` —— 没有选择器，直接作用在根节点
-        if (selector.isEmpty()) {
-            val root = element ?: document
-            return root?.let { extractAttr(it, attr) } ?: ""
-        }
-
-        var explicitIndex = -1
-
-        // `div.0` 这类明确下标（注意不要和 class 选择器混淆：只在结尾全是数字时认）
-        val dotIdx = selector.lastIndexOf('.')
-        if (dotIdx > 0 && dotIdx < selector.length - 1) {
-            val tail = selector.substring(dotIdx + 1)
-            if (tail.isNotEmpty() && tail.all { it.isDigit() }) {
-                explicitIndex = tail.toInt()
-                selector = selector.substring(0, dotIdx)
-            }
-        }
-
-        for (cand in selector.split("!")) {
-            val c = cand.trim()
-            if (c.isEmpty()) continue
-            val els = runCatching { queryCss(c) }.getOrDefault(emptyList())
-            val target = if (explicitIndex in els.indices) els[explicitIndex] else els.firstOrNull()
-            val v = target?.let { extractAttr(it, attr) } ?: ""
-            if (v.isNotEmpty()) return v
-        }
-        return ""
-    }
-
-    private fun queryCss(selectorRaw: String): List<Element> {
-        var sel = selectorRaw.trim()
-        if (sel.isEmpty()) return emptyList()
-
-        val root = element
-        val doc = document
-
-        // 空选择器 / `@text` 这种"直接取根节点"的写法
-        if (sel.isEmpty() || sel.startsWith("@")) {
-            // `@text` 已在 findAttrSeparator 之前处理不到，这里兜底返回根
-            val r = root ?: doc
-            return listOfNotNull(r)
-        }
-
-        if (sel.startsWith(">")) {
-            sel = sel.substring(1).trim()
-            if (sel.isEmpty()) return listOfNotNull(root)
-            return root?.select(sel)?.toList() ?: emptyList()
-        }
-        if (sel == "*") {
-            return listOfNotNull(root ?: doc)
-        }
-        // 相对根节点优先（搜索结果条目里的规则要落在当前条目内）
-        if (root != null) {
-            val direct = runCatching { root.select(sel) }.getOrNull()
-            if (direct != null && direct.isNotEmpty()) return direct.toList()
-        }
-        return runCatching { doc?.select(sel)?.toList() }.getOrNull() ?: emptyList()
-    }
+    // ---------------- 属性提取 ----------------
 
     private fun extractAttr(el: Element, attrRaw: String): String {
         val attrs = attrRaw.split("@").filter { it.isNotBlank() }
@@ -356,7 +410,9 @@ class AnalyzeRule {
                 else -> {
                     if (el.hasAttr(name)) {
                         val raw = el.attr(name)
-                        if (name == "href" || name == "src") absoluteUrl(raw) else raw
+                        if (name == "href" || name == "src" || name == "data-src" ||
+                            name == "data-original" || name == "poster"
+                        ) absoluteUrl(raw) else raw
                     } else ""
                 }
             }
@@ -365,31 +421,10 @@ class AnalyzeRule {
         return ""
     }
 
-    private fun findAttrSeparator(rule: String): Int {
-        var bracket = 0
-        var quote: Char? = null
-        var i = 0
-        while (i < rule.length) {
-            val c = rule[i]
-            if (quote != null) {
-                if (c == quote) quote = null
-                i++
-                continue
-            }
-            when (c) {
-                '\'', '"' -> quote = c
-                '(', '[' -> bracket++
-                ')', ']' -> bracket--
-                '@' -> if (bracket == 0) return i
-            }
-            i++
-        }
-        return -1
-    }
-
     private fun absoluteUrl(raw: String): String {
         if (raw.isBlank()) return raw
         if (raw.startsWith("http://") || raw.startsWith("https://")) return raw
+        if (raw.startsWith("data:") || raw.startsWith("javascript:")) return raw
         return UrlHelper.resolve(baseUrl, raw)
     }
 
@@ -481,6 +516,15 @@ class AnalyzeRule {
     // ---------------- 列表 ----------------
 
     private fun evalStringList(ruleStr: String): List<String> {
+        // `&&` 组合在列表上不常见，但 `##` 常见 —— 逐项应用正则
+        val regexSplit = RuleAnalyzer.splitRegex(ruleStr)
+        if (regexSplit != null) {
+            val base = evalStringList(regexSplit.body.trim())
+            return base.mapNotNull { item ->
+                applyRegex(item, regexSplit).takeIf { it.isNotBlank() }
+            }
+        }
+
         val parsed = parse(ruleStr)
         return when (parsed.type) {
             RuleType.Json -> {
@@ -488,14 +532,24 @@ class AnalyzeRule {
                 if (single.isNullOrEmpty()) emptyList() else single.split("\n")
             }
             RuleType.Js -> {
-                lastError = RuleError.UnsupportedApi("@js 规则（首版不支持脚本）")
-                emptyList()
+                val v = runJs(parsed.rule)
+                if (v.isBlank()) emptyList() else v.split("\n")
+            }
+            RuleType.XPath -> {
+                val atIdx = parsed.rule.lastIndexOf('@')
+                val expr = if (atIdx > 0) parsed.rule.substring(0, atIdx) else parsed.rule
+                val attr = if (atIdx > 0) parsed.rule.substring(atIdx + 1) else "text"
+                queryXPath(expr).mapNotNull { el ->
+                    extractAttr(el, attr).takeIf { it.isNotBlank() }
+                }
             }
             else -> {
-                val atIdx = findAttrSeparator(parsed.rule)
-                val selector = if (atIdx >= 0) parsed.rule.substring(0, atIdx) else parsed.rule
-                val attr = if (atIdx >= 0) parsed.rule.substring(atIdx + 1) else "text"
-                queryCss(selector.trim()).mapNotNull { el ->
+                val steps = RuleSteps.splitSteps(interpolate(parsed.rule)).map { it.trim() }
+                if (steps.isEmpty()) return emptyList()
+                val extractor = RuleSteps.extractorOf(steps)
+                val selectorSteps = if (extractor != null) steps.dropLast(1) else steps
+                val attr = extractor ?: "text"
+                selectSteps(selectorSteps).mapNotNull { el ->
                     extractAttr(el, attr).takeIf { it.isNotBlank() }
                 }
             }
@@ -509,4 +563,159 @@ fun JsonElement.asTextSafe(): String = when (this) {
     is JsonObject -> toString()
     is JsonArray -> toString()
     else -> if (isJsonNull) "" else asString
+}
+
+/**
+ * 元素集合的取法 —— 从 [RuleSteps] 抽出来，让单测能直接打。
+ *
+ * 与 [RuleSteps] 的分工：那边负责**语法**（怎么切、怎么解析索引），
+ * 这里负责**求值**（怎么在 jsoup 上取）。
+ */
+internal object Elements2 {
+
+    fun byCss(input: List<Element>, selector: String): List<Element> {
+        val sel = selector.trim()
+        if (sel.isEmpty()) return input
+        if (sel == "*") return input.flatMap { it.getAllElements() }.distinct()
+
+        // `> a` 表示直接子元素，jsoup 的 select 不支持前导 >
+        if (sel.startsWith(">")) {
+            val rest = sel.substring(1).trim()
+            if (rest.isEmpty()) return input.flatMap { it.children() }
+            return input.flatMap { parent ->
+                parent.children().filter { child ->
+                    runCatching { child.`is`(rest) }.getOrDefault(false)
+                }
+            }
+        }
+
+        for (root in input) {
+            val direct = runCatching { root.select(sel).toList() }.getOrNull()
+            if (direct != null) return direct
+        }
+        // 全部 root 都抛异常 → 选择器非法，交给上层报错
+        throw RuleSteps.BadSelectorException(sel, "选择器非法")
+    }
+
+    /**
+     * `class.x` —— Legado 的语义是 **`[class*=x]`（子串包含）**，不是精确类名。
+     *
+     * 这个区别很实际：书源常写 `class.book` 去命中 `class="book-item"`。
+     * 按精确类名查会漏掉一大片，而书源作者在 Legado 里是能用的。
+     */
+    fun byClass(input: List<Element>, name: String): List<Element> {
+        if (name.isBlank()) return emptyList()
+        val out = ArrayList<Element>()
+        for (root in input) {
+            val hit = runCatching {
+                root.select("[class*=${cssQuoted(name)}]").toList()
+            }.getOrElse { emptyList() }
+            if (hit.isNotEmpty()) out.addAll(hit)
+            else out.addAll(root.select("*").filter { it.className().contains(name) })
+        }
+        return out.distinct()
+    }
+
+    fun byId(input: List<Element>, name: String): List<Element> {
+        if (name.isBlank()) return emptyList()
+        val out = ArrayList<Element>()
+        for (root in input) {
+            val hit = runCatching {
+                root.select("[id=${cssQuoted(name)}]").toList()
+            }.getOrElse { emptyList() }
+            if (hit.isNotEmpty()) out.addAll(hit)
+            else out.addAll(root.select("*").filter { it.id() == name })
+        }
+        return out.distinct()
+    }
+
+    fun byTag(input: List<Element>, name: String): List<Element> {
+        val tag = name.trim()
+        if (tag.isEmpty()) return emptyList()
+        val out = ArrayList<Element>()
+        for (root in input) {
+            if (tag.matches(Regex("[A-Za-z][A-Za-z0-9-]*"))) {
+                out.addAll(root.select(tag))
+            } else {
+                out.addAll(root.getAllElements().filter { it.tagName() == tag })
+            }
+        }
+        return out.distinct()
+    }
+
+    /**
+     * `text.关键字`：先按 ownText 精确找，找不到退一步按全文找。
+     *
+     * 为什么要退：很多站把文字包在子 `<span>` 里，父节点的 ownText 是空的，
+     * 但书源作者看的正是浏览器里显示的整段文字。
+     */
+    fun byText(input: List<Element>, needle: String): List<Element> {
+        if (needle.isBlank()) return emptyList()
+        val out = ArrayList<Element>()
+        for (root in input) {
+            out.addAll(root.select("*").filter { it.ownText().contains(needle) })
+        }
+        if (out.isNotEmpty()) return out.distinct()
+        for (root in input) {
+            out.addAll(root.select("*").filter { it.text().contains(needle) })
+        }
+        return out.distinct()
+    }
+
+    fun applyFilters(spec: RuleSteps.Spec, list: List<Element>): List<Element> {
+        if (spec.filters.isEmpty()) return list
+        var out: List<Element> = list
+        for (f in spec.filters) {
+            if (out.isEmpty()) return out
+            out = when (f) {
+                is RuleSteps.Filter.Pick -> {
+                    val idx = resolve(f.index, out.size)
+                    out.getOrNull(idx)?.let { listOf(it) } ?: emptyList()
+                }
+                is RuleSteps.Filter.Exclude -> {
+                    val idx = resolve(f.index, out.size)
+                    out.filterIndexed { i, _ -> i != idx }
+                }
+                is RuleSteps.Filter.Range -> {
+                    val from = resolve(f.from.coerceAtLeast(0), out.size)
+                    val to = if (f.to < 0) out.size - 1 else f.to
+                    if (from > to || from >= out.size) emptyList()
+                    else out.subList(from, (to + 1).coerceAtMost(out.size)).toList()
+                }
+                is RuleSteps.Filter.ExcludeRange -> {
+                    val from = resolve(f.from.coerceAtLeast(0), out.size)
+                    val to = if (f.to < 0) out.size - 1 else f.to
+                    out.filterIndexed { i, _ -> i < from || i > to }
+                }
+            }
+        }
+        return out
+    }
+
+    private fun resolve(index: Int, size: Int): Int =
+        if (index < 0) size + index else index
+
+    /** jsoup 的 CSS 转义：`.1a` / `a.b` 这种名字必须转义，否则抛异常。 */
+    private fun cssEscape(name: String): String {
+        val sb = StringBuilder()
+        for (c in name) {
+            when {
+                c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '-' || c == '_' -> sb.append(c)
+                else -> sb.append('\\').append(c)
+            }
+        }
+        if (name.isNotEmpty() && name[0].isDigit()) sb.insert(0, '\\')
+        return sb.toString()
+    }
+
+    /**
+     * 属性选择器里的字符串字面量。
+     *
+     * jsoup 要求**带引号**才认 `[class*="foo"]`，裸写的 `[class*=foo]`
+     * 在名字含 `-` / `.` 时会解析失败。所以统一加双引号并转义内部引号。
+     */
+    private fun cssQuoted(name: String): String {
+        val escaped = name.replace("\\", "\\\\").replace("\"", "\\\"")
+        return "\"$escaped\""
+    }
 }

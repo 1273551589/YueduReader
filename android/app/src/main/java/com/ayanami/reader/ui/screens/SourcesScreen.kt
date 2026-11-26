@@ -1,5 +1,6 @@
 package com.ayanami.reader.ui.screens
 
+import com.ayanami.reader.ui.components.statusBarTopPadding
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -33,11 +34,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
@@ -77,7 +80,7 @@ fun SourcesScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(t.background)) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 20.dp, end = 14.dp),
+            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = statusBarTopPadding() + 4.dp, end = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) {
@@ -219,6 +222,36 @@ private fun SourceRow(
             Text("抽样：$it", style = MaterialTheme.typography.bodySmall, color = t.textSecondary)
         }
 
+        // ---- 四段校验结果（v0.4.0）----
+        // 以前只有一个绿标/红标，用户不知道是哪一步挂了。
+        // 现在把 搜索 → 详情 → 目录 → 正文 逐段摊开，一眼看出卡在哪。
+        if (check != null && check.stages.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                check.stages.forEach { st ->
+                    StageChip(
+                        label = shortStageLabel(st.name),
+                        passed = st.passed,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            val failed = check.stages.lastOrNull { !it.passed }
+            if (failed != null && failed.note.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "${stageLabel(failed.name)}：${failed.note}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = t.accent,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
         // ---- 具体哪条规则出错 ----
         // 优先取致命错误；没有则取警告里的（能跑通但字段错的情况）
         val offending: Pair<String, com.ayanami.reader.core.rule.RuleError>? =
@@ -263,6 +296,31 @@ private fun SourceRow(
     }
 }
 
+/**
+ * 四段校验的单个小药丸：通过=绿底，失败=橙底。
+ * 宽度由 weight(1f) 均分，四段并排一行。
+ */
+@Composable
+private fun StageChip(label: String, passed: Boolean, modifier: Modifier = Modifier) {
+    val t = LocalReaderTokens.current
+    val color = if (passed) Color(0xFF2E9E5B) else t.accent
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(color.copy(alpha = if (passed) 0.12f else 0.14f))
+            .padding(vertical = 4.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            fontSize = 10.sp,
+            color = color,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+    }
+}
+
 private fun statusColor(s: SourceChecker.UiStatus, t: com.ayanami.reader.ui.theme.ReaderTokens): Color =
     when (s) {
         SourceChecker.UiStatus.READABLE -> Color(0xFF2E9E5B)
@@ -272,6 +330,16 @@ private fun statusColor(s: SourceChecker.UiStatus, t: com.ayanami.reader.ui.them
         SourceChecker.UiStatus.UNSUPPORTED -> t.textSecondary
         SourceChecker.UiStatus.UNVERIFIED -> t.textSecondary
     }
+
+/** 四段校验药丸用的短标签（一行放得下四个）。 */
+private fun shortStageLabel(stage: String): String = when {
+    stage.startsWith("search") -> "搜索"
+    stage.startsWith("bookInfo") -> "详情"
+    stage.startsWith("toc") -> "目录"
+    stage.startsWith("content") -> "正文"
+    stage.startsWith("explore") -> "发现"
+    else -> stage
+}
 
 /** 把规则里的阶段串翻成人话，用户才知道该改哪个字段。 */
 private fun stageLabel(stage: String): String = when {

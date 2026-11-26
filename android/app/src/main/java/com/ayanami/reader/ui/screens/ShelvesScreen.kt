@@ -1,5 +1,6 @@
 package com.ayanami.reader.ui.screens
 
+import com.ayanami.reader.ui.components.StatusBarSpacer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -10,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -29,7 +32,9 @@ import androidx.compose.material.icons.filled.Search
 import com.ayanami.reader.core.pipeline.SourceChecker
 import com.ayanami.reader.ui.ReaderUiState
 import com.ayanami.reader.ui.ReaderViewModel
+import com.ayanami.reader.ui.components.DividerLine
 import com.ayanami.reader.ui.components.EmptyHint
+import com.ayanami.reader.ui.components.ListRow
 import com.ayanami.reader.ui.components.QuietCard
 import com.ayanami.reader.ui.components.ScreenHeader
 import com.ayanami.reader.ui.theme.LocalReaderTokens
@@ -40,14 +45,15 @@ fun ShelvesScreen(
     state: ReaderUiState,
     onSearch: () -> Unit,
     onSources: () -> Unit,
-    onMods: () -> Unit
+    onMods: () -> Unit,
+    onOpenRecent: (com.ayanami.reader.ui.RecentReading) -> Unit = {}
 ) {
     val t = LocalReaderTokens.current
     val enabled = state.sources.count { it.bookSourceEnabled }
     val readable = state.checks.values.count { it.status == SourceChecker.UiStatus.READABLE }
 
     Column(modifier = Modifier.fillMaxSize().background(t.background)) {
-        Spacer(Modifier.height(28.dp))
+        StatusBarSpacer(4.dp)
         ScreenHeader(
             title = "书架",
             subtitle = if (state.sources.isEmpty()) "还没有书源，先导入一个"
@@ -86,6 +92,14 @@ fun ShelvesScreen(
 
         if (state.sources.isEmpty()) {
             EmptyHint("点「书源」导入 Legado 格式的 JSON，\n或者装一个带 sources 的 MOD")
+        } else if (vm.recentReading.isEmpty()) {
+            Text(
+                "最近阅读",
+                style = MaterialTheme.typography.titleMedium,
+                color = t.textSecondary,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+            EmptyHint("还没有阅读记录。\n从「书城」或「搜索」找一本书开始读。")
         } else {
             Text(
                 "最近阅读",
@@ -93,7 +107,17 @@ fun ShelvesScreen(
                 color = t.textSecondary,
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
             )
-            EmptyHint("阅读进度已在本地记录；书架 UI 是后续项")
+            LazyColumn {
+                items(vm.recentReading) { item ->
+                    ListRow(
+                        title = item.bookName.ifBlank { "未知书名" },
+                        subtitle = item.chapterTitle,
+                        trailing = item.timeLabel,
+                        onClick = { onOpenRecent(item) }
+                    )
+                    DividerLine()
+                }
+            }
         }
         Spacer(Modifier.weight(1f))
     }

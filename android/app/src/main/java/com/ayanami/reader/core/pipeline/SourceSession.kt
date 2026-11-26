@@ -12,18 +12,28 @@ import com.ayanami.reader.core.rule.LenientJson
 import com.ayanami.reader.core.rule.RuleAnalyzer
 import com.ayanami.reader.core.rule.RuleError
 import com.ayanami.reader.core.rule.JsRuntime
+import com.ayanami.reader.core.rule.RuleSteps
 import com.ayanami.reader.core.rule.RuleType
 import com.ayanami.reader.core.rule.UrlHelper
+import com.ayanami.reader.core.rule.UrlOption
+import com.ayanami.reader.core.rule.UrlTemplate
 
 /**
  * 一次书源会话：搜索 → 详情 → 目录 → 正文。
  *
  * **实例粒度是本类最重要的一条纪律**（方案 §4.5）：
  * 四个阶段各自 new 一个 [AnalyzeRule]，正文阶段内部复用。
- * 理由：`isRegex` 一旦被 `getElement(":...")` 置 true 就永不复位，
- * 复用一个实例会让后续所有 `getString` 静默走正则模式。
+ * 理由：规则缓存与错误状态是实例字段，复用一个实例会让
+ * 上一阶段的失败污染这一阶段的判断。
  *
  * 变量表 [sharedVars] 是唯一的跨阶段状态，`@put/@get` 靠它累积。
+ *
+ * ### v0.4.0 修复的请求层缺陷
+ *
+ * - 相对 `searchUrl` / `exploreUrl` / `tocUrl` 一律通过 [UrlTemplate]
+ *   与 `bookSourceUrl` 拼成绝对地址（书源写 `/s.php` 时以前直接抛 URL 异常）
+ * - POST body 里的 `{{key}}` / `{{page}}` 真做替换（以前原样发出去 → 搜空）
+ * - 请求参数按书源声明的 `charset` 编码（GBK 站以前用 UTF-8 编码 → 乱码）
  */
 class SourceSession(
     val source: BookSource,
@@ -43,6 +53,10 @@ class SourceSession(
         if (raw.isNullOrBlank()) emptyMap()
         else LenientJson.parseStringMap(raw) ?: emptyMap()
     }
+
+    /** 书源基地址：所有相对地址都相对它解析。 */
+    private val baseUrl: String
+        get() = source.bookSourceUrl.trim().trimEnd('/')
 
     fun putSharedVar(key: String, value: String) {
         sharedVars[key] = value
@@ -64,8 +78,90 @@ class SourceSession(
         jsLogs.clear()
     }
 
-    // ---------------- 搜索 ----------------
+    // ---------------- 请求构建 ----------------
 
+    /** 一次请求的完整描述 —— 把 URL/Body/字符集三件事收口。 */
+    private data class Request(
+        val url: String,
+        val method: String,
+        val body: String?,
+        val charset: String?
+    )
+
+    /**
+     * 从模板构建请求。
+     *
+     * @param template  书源里的原始串，可能是 `url` 或 `url,{json}`
+     * @param vars      变量表（`key` / `page`，以及 `@put` 写入的）
+     * @param resolveBase 相对地址的基地址；null 表示用 `bookSourceUrl`
+     */
+    private fun buildRequest(
+        template: String,
+        vars: Map<String, String>,
+        resolveBase: String? = null
+    ): Request {
+        val (rawUrl, rawOption) = UrlTemplate.splitUrlOption(template)
+        val option: UrlOption? = rawOption?.let { LenientJson.parseUrlOption(it) }
+        val charset = option?.charset
+        val base = resolveBase ?: baseUrl
+
+        val url = UrlTemplate.render(
+            template = rawUrl,
+            vars = vars,
+            charset = charset,
+            baseUrl = base,
+            encode = true
+        )
+
+        val method = (option?.method ?: "GET").uppercase()
+
+        // body 可能是字符串，也可能是对象/数组 —— Legado 里对象要序列化成 JSON
+        val rawBody: String? = when (val b = option?.body) {
+            null -> null
+            is String -> b
+            else -> LenientJson.lenient.toJson(b)
+        }
+
+        val body = rawBody?.let { b ->
+            UrlTemplate.render(
+                template = b,
+                vars = vars,
+                charset = charset,
+                baseUrl = "",
+                // form 编码的 body 要编；JSON body 不能编，否则引号变 %22
+                encode = !b.trimStart().startsWith("{")
+            )
+        }
+
+        return Request(url, method, body, charset)
+    }
+
+    /** 发一次请求，失败时把错误落到 [lastError]。 */
+    private suspend fun execute(req: Request, extraHeaders: Map<String, String>? = null): String? {
+        val res = fetcher.fetch(
+            url = req.url,
+            method = req.method,
+            body = req.body,
+            headers = mergedHeaders(extraHeaders),
+            charsetName = req.charset
+        )
+        return when (res) {
+            is FetchResult.Ok -> res.body
+            is FetchResult.Err -> {
+                lastError = res.error
+                null
+            }
+        }
+    }
+
+    // ---------------- 解析搜索/发现页 ----------------
+
+    /**
+     * 搜索。
+     *
+     * @param keyword 关键词
+     * @param page    页码（`{{page}}`）
+     */
     suspend fun search(keyword: String, page: Int = 1): List<SearchBook> {
         val searchUrl = source.searchUrl
         if (searchUrl.isNullOrBlank()) {
@@ -73,48 +169,140 @@ class SourceSession(
             return emptyList()
         }
         val rule = source.ruleSearch
-        if (rule.bookList.isNullOrBlank()) {
+        val listRule = rule.bookList
+        if (listRule.isNullOrBlank()) {
             lastError = RuleError.SkippedStage("书源没有配置搜索规则")
             return emptyList()
         }
 
         currentStage = "search"
-        val urlTemplate = searchUrl
-            .replace("{{key}}", encode(keyword))
-            .replace("{{page}}", page.toString())
-        val (url, option) = splitUrlOption(urlTemplate)
-
-        val res = fetcher.fetch(
-            url = url,
-            method = option?.method ?: "GET",
-            body = option?.body?.toString(),
-            headers = mergedHeaders(option?.headers),
-            charsetName = option?.charset
+        val req = buildRequest(
+            searchUrl,
+            vars = mapOf("key" to keyword, "page" to page.toString()),
+            resolveBase = baseUrl
         )
-        val body = when (res) {
-            is FetchResult.Ok -> res.body
-            is FetchResult.Err -> {
-                lastError = res.error
-                return emptyList()
-            }
+        val body = execute(req) ?: return emptyList()
+
+        return parseList(
+            body = body,
+            pageUrl = req.url,
+            listRule = listRule,
+            name = rule.name,
+            author = rule.author,
+            kind = rule.kind,
+            intro = rule.intro,
+            lastChapter = rule.lastChapter,
+            updateTime = rule.updateTime,
+            coverUrl = rule.coverUrl,
+            wordCount = rule.wordCount,
+            bookUrl = rule.bookUrl
+        )
+    }
+
+    /**
+     * 发现页（书城）。
+     *
+     * `exploreUrl` 是 Legado 的特殊字段，格式是
+     * `分类名::地址` 用 `\n` 或 `&&` 分隔的多条；不带 `::` 时整串当一条。
+     *
+     * @param exploreUrl 单条发现页地址（分类由调用方拆好传进来）
+     */
+    suspend fun explore(exploreUrl: String, page: Int = 1): List<SearchBook> {
+        val rule = source.ruleExplore
+        val listRule = rule.bookList
+        if (listRule.isNullOrBlank()) {
+            lastError = RuleError.SkippedStage("书源没有配置发现规则")
+            return emptyList()
         }
 
-        val analyze = attachJs(newAnalyzer(body, url))
+        currentStage = "explore"
+        val req = buildRequest(
+            exploreUrl,
+            vars = mapOf("page" to page.toString(), "key" to ""),
+            resolveBase = baseUrl
+        )
+        val body = execute(req) ?: return emptyList()
 
-        // `init` 之类的前置动作：首版不做，但记录显式不支持
-        val listRule: String = rule.bookList ?: ""
+        return parseList(
+            body = body,
+            pageUrl = req.url,
+            listRule = listRule,
+            name = rule.name,
+            author = rule.author,
+            kind = rule.kind,
+            intro = rule.intro,
+            lastChapter = rule.lastChapter,
+            updateTime = rule.updateTime,
+            coverUrl = rule.coverUrl,
+            wordCount = rule.wordCount,
+            bookUrl = rule.bookUrl
+        )
+    }
+
+    /**
+     * 拆 `exploreUrl` 成 `分类名 to 地址` 列表。
+     *
+     * Legado 的写法：
+     * ```
+     * 玄幻::https://a.com/list/xhuan.html
+     * 都市::https://a.com/list/dushi.html
+     * ```
+     * 也支持 `&&` 分隔、以及单条不带分类名的裸地址。
+     */
+    fun exploreCategories(): List<Pair<String, String>> {
+        val raw = source.exploreUrl
+        if (raw.isNullOrBlank()) return emptyList()
+
+        // 先按 `&&` 切，再按换行切 —— 顺序不能反，否则 `a&&b` 会被拆成
+        // 三个标签却只认出两条，分类数对不上
+        val entries = raw.split("&&")
+            .flatMap { it.split('\n') }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
+        val out = ArrayList<Pair<String, String>>()
+        for (line in entries) {
+            val idx = line.indexOf("::")
+            when {
+                idx > 0 -> {
+                    val name = line.substring(0, idx).trim()
+                    val url = line.substring(idx + 2).trim()
+                    if (url.isNotEmpty()) out.add(name to url)
+                }
+                line.startsWith("http") || line.startsWith("/") -> out.add("全部" to line)
+                else -> Unit   // 认不出的行跳过，不污染分类列表
+            }
+        }
+        return out
+    }
+
+    /** 搜索 / 发现共用的列表解析。 */
+    private fun parseList(
+        body: String,
+        pageUrl: String,
+        listRule: String,
+        name: String?,
+        author: String?,
+        kind: String?,
+        intro: String?,
+        lastChapter: String?,
+        updateTime: String?,
+        coverUrl: String?,
+        wordCount: String?,
+        bookUrl: String?
+    ): List<SearchBook> {
+        val analyze = attachJs(newAnalyzer(body, pageUrl))
+
         val elements = analyze.getElements(stripForList(listRule))
         if (elements.isEmpty()) {
-            lastError = RuleError.SelectorEmpty("search.bookList")
+            lastError = RuleError.SelectorEmpty("$currentStage.bookList")
             return emptyList()
         }
 
         val out = ArrayList<SearchBook>()
         // 只有规则里真出现 @js 才建引擎 —— 26 条搜索结果不值得建 26 个 Rhino
         val searchRules = listOf(
-            rule.name, rule.author, rule.kind, rule.intro,
-            rule.lastChapter, rule.updateTime, rule.coverUrl,
-            rule.wordCount, rule.bookUrl
+            name, author, kind, intro, lastChapter, updateTime, coverUrl, wordCount, bookUrl
         )
         val needJs = searchRules.any { needsJs(it) }
 
@@ -122,29 +310,31 @@ class SourceSession(
             // 每条再用独立实例，避免条目间状态串
             val per = AnalyzeRule().apply {
                 bindSharedVars(sharedVars)
-                setContent(el, url)
+                setContent(el, pageUrl)
                 onRuleError = { e -> noteWarning(currentStage, e) }
             }
             if (needJs) attachJsForElement(per, el)
-            val name = per.getString(rule.name ?: "@text")?.trim().orEmpty()
-            if (name.isEmpty()) continue
+            val bookName = per.getString(name ?: "tag.a@text")?.trim().orEmpty()
+            if (bookName.isEmpty()) continue
+            val url = per.getString(bookUrl ?: "tag.a@href")?.trim().orEmpty()
+            if (url.isEmpty()) continue
             out.add(
                 SearchBook(
-                    name = name,
-                    author = per.getString(rule.author)?.trim().orEmpty(),
-                    kind = per.getString(rule.kind)?.takeIf { it.isNotBlank() },
-                    intro = per.getString(rule.intro)?.takeIf { it.isNotBlank() },
-                    lastChapter = per.getString(rule.lastChapter)?.takeIf { it.isNotBlank() },
-                    updateTime = per.getString(rule.updateTime)?.takeIf { it.isNotBlank() },
-                    coverUrl = per.getString(rule.coverUrl)?.takeIf { it.isNotBlank() },
-                    wordCount = per.getString(rule.wordCount)?.takeIf { it.isNotBlank() },
-                    bookUrl = per.getString(rule.bookUrl ?: "@href")?.trim().orEmpty(),
+                    name = bookName,
+                    author = per.getString(author)?.trim().orEmpty(),
+                    kind = per.getString(kind)?.takeIf { it.isNotBlank() },
+                    intro = per.getString(intro)?.takeIf { it.isNotBlank() },
+                    lastChapter = per.getString(lastChapter)?.takeIf { it.isNotBlank() },
+                    updateTime = per.getString(updateTime)?.takeIf { it.isNotBlank() },
+                    coverUrl = per.getString(coverUrl)?.takeIf { it.isNotBlank() },
+                    wordCount = per.getString(wordCount)?.takeIf { it.isNotBlank() },
+                    bookUrl = url,
                     origin = source.bookSourceUrl,
                     originName = source.bookSourceName
                 )
             )
         }
-        if (out.isEmpty()) lastError = RuleError.SelectorEmpty("search.items")
+        if (out.isEmpty()) lastError = RuleError.SelectorEmpty("$currentStage.items")
         return out
     }
 
@@ -152,25 +342,18 @@ class SourceSession(
 
     suspend fun bookInfo(bookUrl: String): Book? {
         val rule = source.ruleBookInfo
-        val url = rule.init?.let { _ ->
-            // `init` 是规则串而非 URL；首版不做二次请求
-            bookUrl
-        } ?: bookUrl
 
         currentStage = "bookInfo"
-        val res = fetcher.fetch(url, headers = mergedHeaders())
-        val body = when (res) {
-            is FetchResult.Ok -> res.body
-            is FetchResult.Err -> {
-                lastError = res.error
-                return null
-            }
-        }
+        val url = UrlTemplate.resolveIfRelative(baseUrl, bookUrl)
+        val body = execute(Request(url, "GET", null, null)) ?: return null
 
         val analyze = attachJs(newAnalyzer(body, url))
 
-        val name = analyze.getString(rule.name ?: "h1@text")?.trim().orEmpty()
+        val name = analyze.getString(rule.name ?: "tag.h1@text")?.trim().orEmpty()
+        // tocUrl 可能是相对地址 —— 不拼就会拿 "/list/1.html" 去发请求
         val tocUrl = analyze.getString(rule.tocUrl)?.trim().orEmpty()
+            .let { if (it.isBlank()) url else UrlTemplate.resolveIfRelative(url, it) }
+
         return Book(
             name = name,
             author = analyze.getString(rule.author)?.trim().orEmpty(),
@@ -180,7 +363,7 @@ class SourceSession(
             updateTime = analyze.getString(rule.updateTime)?.takeIf { it.isNotBlank() },
             coverUrl = analyze.getString(rule.coverUrl)?.takeIf { it.isNotBlank() },
             wordCount = analyze.getString(rule.wordCount)?.takeIf { it.isNotBlank() },
-            tocUrl = tocUrl.ifBlank { url },
+            tocUrl = tocUrl,
             bookUrl = url,
             origin = source.bookSourceUrl,
             originName = source.bookSourceName
@@ -199,30 +382,22 @@ class SourceSession(
         }
 
         currentStage = "toc"
-        val url = book.tocUrl.ifBlank { book.bookUrl }
-        val res = fetcher.fetch(url, headers = mergedHeaders())
-        val body = when (res) {
-            is FetchResult.Ok -> res.body
-            is FetchResult.Err -> {
-                lastError = res.error
-                return emptyList()
-            }
-        }
-
-        val chapterListRule: String = rule.chapterList ?: ""
+        val startUrl = UrlTemplate.resolveIfRelative(
+            baseUrl,
+            book.tocUrl.ifBlank { book.bookUrl }
+        )
         val out = ArrayList<BookChapter>()
         val visitedPages = LinkedHashSet<String>()
 
-        // 目录分页：`nextTocUrl` 给出下一页地址。
-        // 每轮都重新抓（首轮用已经拿到的 body，避免重复请求）。
-        var pageUrl: String? = url
-        var firstBody: String? = body
+        var pageUrl: String? = startUrl
+        var firstBody: String? = execute(Request(startUrl, "GET", null, null))
+        if (firstBody == null) return emptyList()
 
         while (pageUrl != null && visitedPages.size < MAX_TOC_PAGES) {
             if (!visitedPages.add(pageUrl)) break
 
             val currentBody = firstBody ?: run {
-                val r = fetcher.fetch(pageUrl!!, headers = mergedHeaders())
+                val r = HttpFetcher.fetch(pageUrl!!, headers = mergedHeaders())
                 if (r is FetchResult.Ok) r.body else {
                     if (out.isEmpty()) lastError = (r as FetchResult.Err).error
                     break
@@ -237,7 +412,11 @@ class SourceSession(
                 ?.takeIf { it.isNotBlank() }
                 ?.let { r -> analyze.getString(r)?.trim().orEmpty().ifEmpty { null } }
 
-            val elements = analyze.getElements(stripForList(chapterListRule))
+            val elements = try {
+                analyze.getElements(stripForList(rule.chapterList ?: ""))
+            } catch (e: UnsupportedRuleException) {
+                return emptyList()
+            }
             if (elements.isEmpty() && out.isEmpty()) {
                 lastError = RuleError.SelectorEmpty("toc.chapterList")
                 return emptyList()
@@ -254,13 +433,14 @@ class SourceSession(
                     onRuleError = { e -> noteWarning(currentStage, e) }
                 }
                 if (needJs) attachJsForElement(per, el)
-                val title = per.getString(rule.chapterName ?: "@text")?.trim().orEmpty()
-                val chapterUrl = per.getString(rule.chapterUrl ?: "@href")?.trim().orEmpty()
-                if (title.isEmpty() || chapterUrl.isEmpty()) continue
+                val title = per.getString(rule.chapterName ?: "tag.a@text")?.trim().orEmpty()
+                val chapterUrlRaw = per.getString(rule.chapterUrl ?: "tag.a@href")?.trim().orEmpty()
+                if (title.isEmpty() || chapterUrlRaw.isEmpty()) continue
+                val chapterUrl = UrlTemplate.resolveIfRelative(pageUrl, chapterUrlRaw)
                 out.add(BookChapter(title = title, url = chapterUrl, index = out.size))
             }
 
-            pageUrl = nextRaw?.let { UrlHelper.resolve(pageUrl, it) }
+            pageUrl = nextRaw?.let { UrlTemplate.resolveIfRelative(pageUrl, it) }
         }
 
         if (out.isEmpty()) lastError = RuleError.SelectorEmpty("toc.items")
@@ -281,17 +461,11 @@ class SourceSession(
         }
 
         currentStage = "content"
-        val res = fetcher.fetch(chapter.url, headers = mergedHeaders())
-        val body = when (res) {
-            is FetchResult.Ok -> res.body
-            is FetchResult.Err -> {
-                lastError = res.error
-                return null
-            }
-        }
+        val chapterUrl = UrlTemplate.resolveIfRelative(baseUrl, chapter.url)
+        val body = execute(Request(chapterUrl, "GET", null, null)) ?: return null
 
         // 正文阶段内复用同一实例（同一章的分页合并、图片抽取都靠它）
-        val analyze = attachJs(newAnalyzer(body, chapter.url))
+        val analyze = attachJs(newAnalyzer(body, chapterUrl))
 
         val text = analyze.getString(rule.content)?.trim().orEmpty()
         if (text.isEmpty()) {
@@ -303,17 +477,17 @@ class SourceSession(
         // ---- 正文分页 ----
         // 很多站的正文是分页的，不合并就只能读到第一页 —— 这是"读不完一本书"的直接原因。
         val pieces = ArrayList<String>().apply { add(text) }
-        val visited = LinkedHashSet<String>().apply { add(chapter.url) }
+        val visited = LinkedHashSet<String>().apply { add(chapterUrl) }
         var nextUrl: String? = rule.nextContentUrl
             ?.takeIf { it.isNotBlank() }
             ?.let { analyze.getString(it)?.trim().orEmpty().ifEmpty { null } }
-            ?.let { UrlHelper.resolve(chapter.url, it) }
+            ?.let { UrlTemplate.resolveIfRelative(chapterUrl, it) }
 
         var pageCount = 1
         while (nextUrl != null && pageCount < maxPages) {
             if (!visited.add(nextUrl)) break
 
-            val r = fetcher.fetch(nextUrl, headers = mergedHeaders())
+            val r = HttpFetcher.fetch(nextUrl, headers = mergedHeaders())
             if (r !is FetchResult.Ok) break
 
             val pageAnalyze = attachJs(newAnalyzer(r.body, nextUrl))
@@ -322,10 +496,11 @@ class SourceSession(
             pieces.add(pageText)
             pageCount++
 
+            val cur = nextUrl
             nextUrl = rule.nextContentUrl
                 ?.takeIf { it.isNotBlank() }
                 ?.let { pageAnalyze.getString(it)?.trim().orEmpty().ifEmpty { null } }
-                ?.let { UrlHelper.resolve(nextUrl!!, it) }
+                ?.let { UrlTemplate.resolveIfRelative(cur, it) }
         }
 
         val merged = pieces.joinToString("\n")
@@ -333,20 +508,11 @@ class SourceSession(
         // 正文内的图（图片型源与插图）
         val images = Regex("""<img[^>]+src=['"]([^'"]+)['"]""")
             .findAll(merged)
-            .map { UrlHelper.resolve(chapter.url, it.groupValues[1]) }
+            .map { UrlTemplate.resolveIfRelative(chapterUrl, it.groupValues[1]) }
             .distinct()
             .toList()
 
-        val clean = merged
-            .replace(Regex("""<br\s*/?>"""), "\n")
-            .replace(Regex("""</p>"""), "\n")
-            .replace(Regex("""<[^>]+>"""), "")
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace(Regex("""\n{3,}"""), "\n\n")
-            .trim()
+        val clean = cleanHtml(merged)
 
         if (clean.isEmpty() && images.isEmpty()) {
             lastError = RuleError.SelectorEmpty("content.text")
@@ -355,54 +521,46 @@ class SourceSession(
 
         return TextChapter(
             title = chapter.title,
-            url = chapter.url,
+            url = chapterUrl,
             text = clean,
             images = images
         )
     }
 
+    private fun cleanHtml(html: String): String = html
+        .replace(Regex("""<br\s*/?>"""), "\n")
+        .replace(Regex("""</p>"""), "\n")
+        .replace(Regex("""<[^>]+>"""), "")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace(Regex("""\n{3,}"""), "\n\n")
+        .trim()
+
     // ---------------- helpers ----------------
 
-    /** `searchUrl`/`tocUrl` 可能是 `url,{json}`。 */
-    private fun splitUrlOption(raw: String): Pair<String, com.ayanami.reader.core.rule.UrlOption?> {
-        val trimmed = raw.trim()
-        val comma = findTopLevelComma(trimmed)
-        if (comma < 0) return trimmed to null
-        val url = trimmed.substring(0, comma)
-        val json = trimmed.substring(comma + 1)
-        return url to LenientJson.parseUrlOption(json)
-    }
-
-    private fun findTopLevelComma(s: String): Int {
-        var depth = 0
-        for (i in s.indices) {
-            when (s[i]) {
-                '{', '[' -> depth++
-                '}', ']' -> depth--
-                ',' -> if (depth == 0) return i
-            }
-        }
-        return -1
-    }
-
     /**
-     * 列表型规则可能带 `@` 属性后缀，`getElements` 只吃选择器部分；
-     * 另外首版不支持 `@js`，命中要显式报 UnsupportedApi。
+     * 列表型规则只吃选择器部分。
+     *
+     * v0.4.0 起统一走 [RuleSteps.selectorSteps] —— 之前用 `indexOf('@')`
+     * 只切第一段，`class.odd.0@tag.a@href` 的列表规则会被截成
+     * `class.odd.0`，丢掉整段下钻。
      */
     private fun stripForList(ruleRaw: String): String {
         val parsed = RuleAnalyzer.parsePrefix(ruleRaw)
         if (parsed.type == RuleType.Js) {
-            lastError = RuleError.UnsupportedApi("@js 规则（首版不支持脚本）")
+            lastError = RuleError.UnsupportedApi("@js 规则（列表选择器不支持脚本）")
             throw UnsupportedRuleException()
         }
-        // 去掉 `##正则##` 尾巴与 `@attr`
+        // 去掉 `##正则##` 尾巴（列表层的正则在逐条取值时应用）
         val noRegex = parsed.rule.substringBefore("##").trim()
-        val at = noRegex.indexOf('@')
-        return if (at > 0) noRegex.substring(0, at).trim() else noRegex
+        val steps = RuleSteps.splitSteps(noRegex).map { it.trim() }.filter { it.isNotEmpty() }
+        val sel = RuleSteps.selectorSteps(steps)
+        return sel.joinToString("@")
     }
-
-    private fun encode(s: String): String =
-        java.net.URLEncoder.encode(s, "UTF-8")
 
     /**
      * 每阶段一个全新的 [AnalyzeRule]，并配一个属于它的 [JsRuntime]。
@@ -424,7 +582,6 @@ class SourceSession(
     @Volatile
     var currentStage: String = ""
 
-    /** 需要 JS 的阶段用这个：额外接一个 bridge（依赖已建好的 analyzer）。 */
     /**
      * 阶段级 `@js` 运行时。
      *
@@ -433,9 +590,6 @@ class SourceSession(
      * 而 `AnalyzeRule` 已经把 HTML 存进自己的 `element/document` 了，
      * `java.getString` 走的是那条路径。这里只在**条目级**（[attachJsForElement]）
      * 才需要给出具体的 Element。
-     *
-     * （v0.3.3 曾误以为这里是缺陷并加了冗余参数；注入回归验证后确认它不改变行为，
-     * 已删掉，避免后人以为那参数在起作用。）
      */
     private fun attachJs(analyzer: AnalyzeRule): AnalyzeRule {
         val bridge = HttpJsBridge(
@@ -451,7 +605,8 @@ class SourceSession(
     /** 这条规则串是否需要 JS 运行时。 */
     private fun needsJs(rule: String?): Boolean {
         if (rule.isNullOrBlank()) return false
-        return rule.contains("@js:", ignoreCase = true) || rule.contains("<js>", ignoreCase = true)
+        return rule.contains("@js:", ignoreCase = true) ||
+            rule.contains("<js>", ignoreCase = true)
     }
 
     /** 给某个条目元素配 JS 运行时：`java.getString` 要落在这一条上。 */

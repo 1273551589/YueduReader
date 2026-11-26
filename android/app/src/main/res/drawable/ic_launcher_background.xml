@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标背景：暖米色底 + 极淡的斜向几何纹理，呼应阅读纸张 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#F2EFE9"
+        android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
+    <!-- 右上角一圈大圆弧，给纯色底一点层次 -->
+    <path
+        android:fillColor="#E6E0D5"
+        android:fillAlpha="0.75"
+        android:pathData="M108,0 L108,44 C86,44 68,26 68,4 C68,2.7 68.1,1.3 68.2,0 Z" />
+    <!-- 左下角小块 -->
+    <path
+        android:fillColor="#E6E0D5"
+        android:fillAlpha="0.5"
+        android:pathData="M0,88 L20,108 L0,108 Z" />
+</vector>

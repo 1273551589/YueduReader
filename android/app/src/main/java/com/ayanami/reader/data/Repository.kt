@@ -122,11 +122,23 @@ class Repository(private val context: Context) {
 
     // ---------------- 阅读进度 ----------------
 
-    fun saveProgress(bookUrl: String, chapterIndex: Int, chapterTitle: String) {
+    /**
+     * 保存阅读进度。
+     *
+     * @param bookName 书名。**必须带**，否则书架「最近阅读」只能显示 URL 尾巴，
+     *   用户根本认不出是哪本书。旧版本没存这个字段，所以读侧做了兜底。
+     */
+    fun saveProgress(
+        bookUrl: String,
+        chapterIndex: Int,
+        chapterTitle: String,
+        bookName: String = ""
+    ) {
         val map = loadProgress()
         map[bookUrl] = mapOf(
             "index" to chapterIndex,
             "title" to chapterTitle,
+            "name" to bookName,
             "time" to System.currentTimeMillis()
         )
         progressFile.writeText(gson.toJson(map))

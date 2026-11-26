@@ -1,5 +1,6 @@
 package com.ayanami.reader.ui.screens
 
+import com.ayanami.reader.ui.components.statusBarTopPadding
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -65,7 +66,7 @@ fun ModsScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(t.background)) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 20.dp, end = 14.dp),
+            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = statusBarTopPadding() + 4.dp, end = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) {

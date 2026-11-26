@@ -11,11 +11,15 @@ import com.ayanami.reader.core.model.TextChapter
 import com.ayanami.reader.core.pipeline.SourceChecker
 import com.ayanami.reader.core.pipeline.SourceImporter
 import com.ayanami.reader.core.pipeline.SourceSession
+import com.ayanami.reader.core.bookstore.BookstoreEngine
+import com.ayanami.reader.core.download.DownloadEngine
 import com.ayanami.reader.data.Repository
+import com.ayanami.reader.data.Settings
 import com.ayanami.reader.mod.ModLoader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -50,17 +54,61 @@ data class ReaderUiState(
 
 class ReaderViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val repo = Repository(app)
-    private val _state = MutableStateFlow(ReaderUiState())
+    internal val repo = Repository(app)
+    internal val _state = MutableStateFlow(ReaderUiState())
     val state: StateFlow<ReaderUiState> = _state.asStateFlow()
 
     var mods: ModLoader.LoadResult = ModLoader.load(emptyList()) { null }
     var activeModTheme: ModLoader.ThemeTokens? = null
     var modErrors: List<String> = emptyList()
 
+    /** 全局设置（R18 开关、阅读器偏好、Pixiv 配置）。 */
+    val settings = Settings(app)
+
+    /** 章节离线缓存引擎。缓存目录在 app 私有 files 下。 */
+    val download = DownloadEngine(
+        viewModelScope,
+        java.io.File(app.filesDir, "cache")
+    )
+
+    /** 书城聚合引擎。 */
+    val bookstoreEngine = BookstoreEngine(viewModelScope)
+
+    /** 书架「最近阅读」列表。 */
+    private val recentReadingState =
+        androidx.compose.runtime.mutableStateOf<List<RecentReading>>(emptyList())
+
+    val recentReading: List<RecentReading> get() = recentReadingState.value
+
+    internal fun setRecentReading(list: List<RecentReading>) {
+        recentReadingState.value = list
+    }
+
+    /** 书城页 UI 状态。 */
+    val bookstoreState = BookstoreState().also {
+        it.genre = settings.bookstoreGenre
+        it.rating = settings.contentRating
+        it.sort = settings.sortMode.name
+    }
+
+    /**
+     * 设置变更计数 —— 用于让 Compose 感知 `SharedPreferences` 的变化。
+     *
+     * 为什么需要：`SharedPreferences` 不是 Compose 快照状态，改完不会触发重组。
+     * 用一个自增的 Compose state 当"信号"，UI 读它就能正确刷新。
+     */
+    private val settingsRevisionState = androidx.compose.runtime.mutableStateOf(0)
+
+    fun settingsTick(): Int = settingsRevisionState.value
+
+    fun notifySettingsChanged() {
+        settingsRevisionState.value = settingsRevisionState.value + 1
+    }
+
     init {
         reloadSources()
         loadMods()
+        loadRecentReading()
     }
 
     // ---------------- 书源 ----------------
@@ -242,6 +290,12 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadChapter(chapter: BookChapter, index: Int) {
+        // 缓存优先：命中就完全不发请求（离线阅读的全部实现）
+        loadChapterWithCache(chapter, index)
+    }
+
+    /** 真正联网抓正文。外部统一走 loadChapter（它先查缓存）。 */
+    fun loadChapterNetwork(chapter: BookChapter, index: Int) {
         val book = _state.value.openedBook ?: return
         val src = _state.value.sources.firstOrNull { it.bookSourceUrl == book.origin } ?: return
         viewModelScope.launch {
@@ -252,7 +306,8 @@ class ReaderViewModel(app: Application) : AndroidViewModel(app) {
                 toast("正文抓取失败")
                 return@launch
             }
-            repo.saveProgress(book.bookUrl, index, chapter.title)
+            repo.saveProgress(book.bookUrl, index, chapter.title, book.name)
+            loadRecentReading()
             _state.value = _state.value.copy(loadingChapter = false, chapter = text)
         }
     }

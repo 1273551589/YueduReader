@@ -11,8 +11,8 @@ android {
         applicationId = "com.ayanami.reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.3.6"
+        versionCode = 10
+        versionName = "0.6.0"
     }
 
     buildTypes {
@@ -33,6 +33,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 设置页要读 VERSION_NAME 显示真实版本号
+        buildConfig = true
     }
 
     packaging {
@@ -65,6 +67,10 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jsoup:jsoup:1.21.2")
+    // OkHttp：替代 HttpURLConnection，继真正支持拦截器（Pixiv Referer 注入要它）
+    implementation("com.squareup.okhttp3:okhttp:5.3.2")
+    // Coil：书封加载。必须用 coil-compose 才能和 Compose 生命周期对齐
+    implementation("io.coil-kt:coil-compose:2.7.0")
     // Rhino：@js 规则。选 1.7.15 而不是 1.9.x —— 1.9 编译到 Java 11+ 字节码，
     // 且用了 Android 上不一定有的 java.lang.invoke 路径；1.7.15 是 Java 8 字节码。
     implementation("org.mozilla:rhino:1.7.15")
